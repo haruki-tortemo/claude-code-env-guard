@@ -1,4 +1,9 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Haruki Yoshino
+#
+# This hook is meant to be distributable as a single file, so it carries its
+# own license identifier: when only this file is copied, the terms travel with it.
 """rc-env-guard: stop environment variables from silently killing Claude Code Remote Control.
 
 Events: PreToolUse (Edit|Write|MultiEdit|Bash), SessionStart, ConfigChange.

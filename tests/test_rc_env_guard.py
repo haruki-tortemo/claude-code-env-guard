@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Haruki Yoshino
 """Regression suite for rc_env_guard.py. One line re-runs everything:
 
     python3 tests/test_rc_env_guard.py

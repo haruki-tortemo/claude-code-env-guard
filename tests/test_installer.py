@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Haruki Yoshino
 """Installer contract tests, with fault injection.
 
 The installer edits a file the user cares about more than anything else we ship.

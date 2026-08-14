@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Haruki Yoshino
 """Install rc-env-guard into Claude Code settings by merging, never replacing.
 
 What installing does:

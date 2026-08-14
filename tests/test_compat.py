@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Haruki Yoshino
 """Contract tests for the interpreter floor check.
 
 A guard's own guard needs tests, or it is decoration. These assert the two

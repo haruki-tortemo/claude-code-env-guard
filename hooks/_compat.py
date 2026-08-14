@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Haruki Yoshino
 """Interpreter floor check — fail closed, loudly.
 
 Why this file exists
