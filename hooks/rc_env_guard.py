@@ -45,12 +45,15 @@ let the CLI itself name the offending variable in its refusal message.
   the destination is judged. Backups (settings as *source*) pass. Enumerating
   shapes can never be complete, so the guarantee is stated as "prevents known
   direct writes"; the rest is caught after the fact by ConfigChange.
-- Self-disarm is refused. In a settings file that registers this guard, all three
-  registrations (PreToolUse / SessionStart / ConfigChange) are checked
-  **structurally**: the matcher as a token set, the command target resolved via
-  shlex + realpath, and a post-image that no longer parses as JSON cannot prove
-  the registration survives, so it is denied. Editing the hook's *code* is free -
-  only deregistration is the invariant.
+- Deregistration on the ordinary Edit/Write path is resisted. In a settings file
+  that registers this guard, all three registrations (PreToolUse / SessionStart /
+  ConfigChange) are checked **structurally**: the matcher as a token set, the
+  command target resolved via shlex + realpath, and a post-image that no longer
+  parses as JSON cannot prove the registration survives, so it is denied. This
+  covers the accidental/structural case only. It is NOT tamper-resistant against
+  a determined actor - editing the hook's own file, env/interpreter tricks,
+  deleting settings via Bash, and unrecognized registration forms all get past
+  it (see README "Known limitations").
 - Deny = exit 2 + stderr (documented hook contract: exit 2 discards stdout and
   returns stderr to the model).
 - Undecidable input is never silently allowed: payload parse failures and internal
@@ -167,6 +170,14 @@ INTERPRETERS = {"python", "python3", "python3.11", "python3.12", "python3.13"}
 # A command containing shell control or expansion is not accepted as a valid
 # registration ("... || true" swallowed the exit 2 in testing).
 SHELL_CONTROL = re.compile(r"\|\||&&|[;&|]|\$\(|`|>>?|<|\n")
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def has_shell_control(command: str) -> bool:
+    """Shell control/expansion OUTSIDE any quoted span. A `shlex.quote`d path
+    that merely contains `&`/`;`/`|` (a directory named `R&D`) is a valid
+    registration, not an evasion - blank quoted spans before testing."""
+    return bool(SHELL_CONTROL.search(_QUOTED_SPAN.sub("", command)))
 
 SETTINGS_RE = re.compile(r"(?:^|/)\.claude/settings(?:\.local)?\.json$")
 SETTINGS_MENTION = re.compile(r"settings(?:\.local)?\.json")
@@ -373,6 +384,54 @@ def strip_wrappers(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
+def _names_settings_file(candidate: str) -> bool:
+    """Does this path name a `.claude/settings(.local).json`?
+
+    Precise on purpose: it matches the settings path, not the bare token, so
+    copying settings.json *out* to another directory (a backup) is not a hit.
+    """
+    normed = os.path.normpath(os.path.expanduser(candidate))
+    return bool(SETTINGS_RE.search(normed.replace(os.sep, "/")))
+
+
+def dest_last_hits_settings(args: list, positional: list) -> bool:
+    """For cp/mv/rsync/install/ln/scp: does the destination become a settings file?
+
+    Handles the directory form (`cp x/settings.json ~/.claude/`), which the
+    lexical last-argument check missed: when the destination is a directory,
+    the file created is `dest/basename(src)` for each source. Also honours
+    `-t DIR` / `--target-directory[=]DIR`, where every positional is a source.
+    """
+    if not positional:
+        return False
+    target_dir = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a in ("-t", "--target-directory") and i + 1 < len(args):
+            target_dir = args[i + 1]
+            i += 2
+            continue
+        if a.startswith("--target-directory="):
+            target_dir = a.split("=", 1)[1]
+        elif a.startswith("-t") and len(a) > 2:
+            target_dir = a[2:]
+        i += 1
+
+    if target_dir is not None:
+        sources, dest = positional, target_dir
+        dest_is_dir = True
+    else:
+        sources, dest = positional[:-1], positional[-1]
+        dest_is_dir = dest.endswith("/") or os.path.isdir(os.path.expanduser(dest))
+
+    if dest_is_dir:
+        return any(
+            _names_settings_file(os.path.join(dest, os.path.basename(s.rstrip("/"))))
+            for s in (sources or positional))
+    return _names_settings_file(dest) or bool(SETTINGS_TOKEN.search(dest))
+
+
 def settings_is_destination(segment: str) -> bool:
     """Is settings the WRITE DESTINATION of this simple command?
 
@@ -401,7 +460,7 @@ def settings_is_destination(segment: str) -> bool:
     if head == "dd":
         return any(a.startswith("of=") and SETTINGS_TOKEN.search(a) for a in args)
     if head in DEST_LAST:
-        return bool(positional) and bool(SETTINGS_TOKEN.search(positional[-1]))
+        return dest_last_hits_settings(args, positional)
     if head in ANY_ARG_WRITERS:
         return any(SETTINGS_TOKEN.search(a) for a in positional)
     if head in INPLACE:
@@ -422,7 +481,7 @@ def command_runs_guard(command) -> bool:
     1 or 2 tokens; match the interpreter name exactly; and require the target's
     realpath to equal this very file.
     """
-    if not isinstance(command, str) or SHELL_CONTROL.search(command):
+    if not isinstance(command, str) or has_shell_control(command):
         return False
     try:
         tokens = shlex.split(command, comments=True)
@@ -536,7 +595,14 @@ def join_line_continuations(command: str) -> str:
 
 def strip_heredoc_bodies(command: str) -> str:
     """Drop heredoc bodies. A commit message that merely *mentions* settings.json
-    must not deny - hit once in real use."""
+    must not deny - hit once in real use.
+
+    Found in review: a fabricated `<<WORD` on an earlier line (e.g. inside a
+    quoted string) whose delimiter never appears made this drop the rest of the
+    command, so a real write below it was never judged. Fix: only drop a body
+    that is actually *terminated*; when the delimiter is never found, keep the
+    remaining lines verbatim (fail closed) so the write is still analysed.
+    """
     lines = command.split("\n")
     kept: list[str] = []
     i = 0
@@ -546,12 +612,16 @@ def strip_heredoc_bodies(command: str) -> str:
         m = HEREDOC_START.search(line)
         if m:
             delimiter = m.group(2)
-            i += 1
-            while i < len(lines) and lines[i].strip() != delimiter:
-                i += 1
-            if i < len(lines):
-                i += 1
-            continue
+            j = i + 1
+            while j < len(lines) and lines[j].strip() != delimiter:
+                j += 1
+            if j < len(lines):
+                # Terminated heredoc: drop the body, keep the terminator line.
+                i = j + 1
+                continue
+            # Unterminated: not a heredoc body we can safely discard.
+            kept.extend(lines[i + 1:])
+            break
         i += 1
     return "\n".join(kept)
 
@@ -613,18 +683,16 @@ def pre_image_killers(path: str) -> set[str]:
     return {v for v in DENY_VARS if v in env and kills(v, env[v])}
 
 
-SELF_DISARM_TEMPLATE = """⛔ rc-env-guard: blocked a change that would disarm this guard itself ({what}).
+SELF_DISARM_TEMPLATE = """⛔ rc-env-guard: blocked a change that would drop this guard's registration ({what}).
 
-Why: found in review - even with Bash writes fully denied, the recommended
-Edit/Write path could still deregister this guard (measured exit 0). From the
-next session on, no Remote-Control-killing env variable would be checked and no
-SessionStart warning would appear. A guard that can be quietly removed protects
-nothing.
+Why: this edit removes or disables the hook's own registration on the ordinary
+Edit/Write path. From the next session on, no Remote-Control-killing env
+variable would be checked and no SessionStart warning would appear.
 
--> To remove it deliberately, the human owner must edit settings.json outside
-   of Claude Code. Verbal approval to the model does not disarm this guard.
--> Fixing the hook's *code* is free: this invariant only checks that the
-   registrations and matchers survive.
+-> To remove the guard deliberately, do it as a considered change, not as a
+   side effect of another edit. See the "Known limitations" section of the
+   README: this invariant covers the accidental/structural case, not a
+   determined bypass.
 File: {path}"""
 
 
@@ -668,6 +736,40 @@ def judge_post_image(path: str, content: str, source: str, fallback_text) -> Non
                      f"({source})"))
 
 
+def targets_settings_file(path: str) -> bool:
+    """Does this Edit/Write file_path resolve to a settings file we watch?
+
+    Found in review (the one finding the security panel verified): matching the
+    raw model-supplied path against a case-sensitive, single-slash regex let
+    equivalent spellings of the same file through -- `.claude//settings.json`,
+    `.claude/./settings.json` (any POSIX host), `.claude/Settings.json` (a
+    case-insensitive macOS/Windows volume), and a symlink to the settings file.
+    Each skipped the whole Edit/Write judgement, defeating the write-time block.
+
+    So: normalize the path (fixes the `//` and `/.` spellings on every host),
+    and, for the case-variant and symlink cases, fall back to real-inode
+    identity against the known settings files. Remaining caveat: a file that
+    does not exist yet cannot be resolved by identity, so a case-variant of a
+    not-yet-created settings file, and native Windows `\\` paths, are still out
+    of scope (documented in the README's "Known limitations").
+    """
+    if not isinstance(path, str) or not path:
+        return False
+    normed = os.path.normpath(os.path.expanduser(path))
+    if SETTINGS_RE.search(normed.replace(os.sep, "/")):
+        return True
+    try:
+        resolved = os.path.realpath(normed)
+        if not os.path.exists(resolved):
+            return False
+        for _scope, known in settings_paths():
+            if os.path.exists(known) and os.path.samefile(resolved, known):
+                return True
+    except OSError:
+        pass
+    return False
+
+
 def check_pre_tool_use(payload: dict) -> None:
     tool = payload.get("tool_name")
     if not isinstance(tool, str) or not tool:
@@ -691,7 +793,7 @@ def check_pre_tool_use(payload: dict) -> None:
         return
 
     path = ti.get("file_path")
-    if not isinstance(path, str) or not SETTINGS_RE.search(path):
+    if not isinstance(path, str) or not targets_settings_file(path):
         return
 
     if tool == "Write":

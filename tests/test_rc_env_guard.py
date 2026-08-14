@@ -52,10 +52,17 @@ EXPECTED_IDS = (
     # Positive: 4 variables x write paths
     "deny-edit-donottrack", "deny-edit-growthbook", "deny-write-telemetry-zero",
     "deny-write-nonessential-zero", "deny-multiedit-second", "deny-write-unmeasured-value",
+    # Positive: equivalent spellings of the settings path resolve to the same file
+    "deny-edit-double-slash", "deny-edit-dot-segment", "deny-write-symlink-to-settings",
     # Positive: Bash shapes with settings as the write destination
     "deny-bash-mv", "deny-bash-cp", "deny-bash-redirect", "deny-bash-jq-then-mv",
     "deny-bash-rsync", "deny-bash-ln", "deny-bash-truncate", "deny-bash-sed-optorder",
     "deny-bash-dd",
+    # Positive: copy/move INTO the .claude directory (destination is a dir, so the
+    # created file is dir/basename(src)) - the lexical last-arg check missed these
+    "deny-bash-cp-into-dir", "deny-bash-mv-into-dir", "deny-bash-cp-target-dir",
+    # Positive: a fabricated, unterminated heredoc marker must not hide a write
+    "deny-bash-fake-heredoc",
     # Positive: line-continuation shapes that split segments (all four passed
     # live before the fix)
     "deny-bash-linecont-redirect", "deny-bash-linecont-tee",
@@ -82,6 +89,8 @@ EXPECTED_IDS = (
     "allow-bash-commit-heredoc", "allow-bash-grep", "allow-bash-json-dumps",
     "allow-bash-stderr-redirect", "allow-bash-tee-elsewhere", "allow-bash-unrelated",
     "allow-bash-cp-backup", "allow-bash-mv-backup", "allow-self-reformat",
+    # Negative: copying settings OUT into another directory is a backup, not a write
+    "allow-bash-cp-into-tmp-dir",
     # Negative: READS containing line continuations (the same hole's flip
     # side - plain reads were being blocked)
     "allow-bash-linecont-read", "allow-bash-linecont-loop",
@@ -245,6 +254,21 @@ def main() -> int:  # noqa: C901
                "new_string": '"A": "1",\n    "DO_NOT_TRACK": "1"'}]}})
     case("deny-write-unmeasured-value", 'Write: unmeasured value "false" fails closed', DENY,
          write(user_clean, {"env": {"DO_NOT_TRACK": "false"}}))
+    # Equivalent path spellings that resolve to the same settings file (F1).
+    case("deny-edit-double-slash", "Edit: `.claude//settings.json` (extra slash)", DENY,
+         edit(user_clean.replace("/.claude/", "/.claude//"),
+              '"OTHER_TOOL_NO_TELEMETRY": "1"',
+              '"OTHER_TOOL_NO_TELEMETRY": "1",\n    "DO_NOT_TRACK": "1"'))
+    case("deny-edit-dot-segment", "Edit: `.claude/./settings.json` (dot segment)", DENY,
+         edit(user_clean.replace("/.claude/", "/.claude/./"),
+              '"OTHER_TOOL_NO_TELEMETRY": "1"',
+              '"OTHER_TOOL_NO_TELEMETRY": "1",\n    "DO_NOT_TRACK": "1"'))
+    sym_home = tmp / "home-symlink"
+    sym_real = write_settings(sym_home, CLEAN)
+    sym_alias = str(Path(sym_real).parent / "settings-alias.json")
+    os.symlink(sym_real, sym_alias)
+    case("deny-write-symlink-to-settings", "Write: a symlink that resolves to settings.json", DENY,
+         write(sym_alias, {"env": {"DO_NOT_TRACK": "1"}}), env_extra={"HOME": str(sym_home)})
 
     print("\n--- Positive: Bash with settings as the write destination ---")
     case("deny-bash-mv", "mv (temp -> settings)", DENY,
@@ -266,6 +290,16 @@ def main() -> int:  # noqa: C901
          bash('sed -E -i "" "/DO_NOT_TRACK/d" ~/.claude/settings.json'))
     case("deny-bash-dd", "dd of=settings", DENY,
          bash("dd if=/tmp/rc-stage.json of=~/.claude/settings.json"))
+    # Copy/move INTO a directory: the created file is <dir>/settings.json.
+    case("deny-bash-cp-into-dir", "cp settings.json into ~/.claude/ (dir dest)", DENY,
+         bash("cp /tmp/settings.json ~/.claude/"))
+    case("deny-bash-mv-into-dir", "mv settings.json into ~/.claude/ (dir dest)", DENY,
+         bash("mv /tmp/settings.json ~/.claude/"))
+    case("deny-bash-cp-target-dir", "cp -t ~/.claude/ settings.json", DENY,
+         bash("cp -t ~/.claude/ /tmp/settings.json"))
+    # A fabricated, never-closed heredoc marker must not delete the write below it.
+    case("deny-bash-fake-heredoc", "fake `<< X` on line 1 hides a write on line 2", DENY,
+         bash('echo "note: a << ZZ"\ncp /tmp/rc-stage.json ~/.claude/settings.json'))
     # Wrapper options used to be misread as the command head ("-i" etc.).
     case("deny-bash-env-i-cp", "env -i cp (through a wrapper option)", DENY,
          bash("env -i cp /tmp/rc-stage.json ~/.claude/settings.json"))
@@ -283,7 +317,8 @@ def main() -> int:  # noqa: C901
 
     print("\n--- Positive: self-disarm is refused ---")
     case("deny-self-remove-both", "Write: removes the registrations wholesale", DENY,
-         write(guarded, strip_registration(guarded_body)), expect_text="disarm")
+         write(guarded, strip_registration(guarded_body)),
+         expect_text="drop this guard's registration")
     case("deny-self-command-swap", "Edit: swaps the command for `true`", DENY,
          edit(guarded, GUARD_CMD[0]["command"], "true"))
     shrunk = json.loads(json.dumps(guarded_body))
@@ -403,6 +438,8 @@ def main() -> int:  # noqa: C901
          bash("cp ~/.claude/settings.json /tmp/settings-backup.json"))
     case("allow-bash-mv-backup", "Bash: mv settings -> /tmp (removal direction)", ALLOW,
          bash("mv ~/.claude/settings.json /tmp/settings-backup.json"))
+    case("allow-bash-cp-into-tmp-dir", "Bash: cp settings -> /tmp/ (backup into a dir)", ALLOW,
+         bash("cp ~/.claude/settings.json /tmp/"))
     case("allow-self-reformat", "Write: reformat, registrations kept", ALLOW,
          write(guarded, guarded_body))
     # Metadata-only operations used to be denied with a reason text ("use

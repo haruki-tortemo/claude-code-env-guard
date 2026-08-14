@@ -74,6 +74,33 @@ Concretely:
 We state this because a guard that overstates its coverage is worse than no guard —
 you stop looking for the thing it claims to handle.
 
+### Known ways a determined actor gets past it
+
+"Deliberate circumvention" above is not hand-waving. These are specific, known bypasses.
+They exist because a hook is a single Python process reacting to one tool call at a time — it
+cannot be a security boundary against an actor (including a prompt-injected model) that is
+actively working around it. If your threat model includes that, this hook is not your control.
+
+- **Equivalent spellings of the settings path.** The write-time check normalizes the path and
+  falls back to real-inode identity, so `~/.claude//settings.json`, `~/.claude/./settings.json`,
+  and a symlink to the settings file are caught, as is a case variant like `~/.claude/Settings.json`
+  **when the file already exists** on a case-insensitive volume. Still out of scope: a case variant
+  of a settings file that does not exist yet, and native Windows `\` paths.
+- **Environment-based interpreter tricks.** A settings write that sets `PATH` or `PYTHONPATH`
+  (neither is on the blocked list) can stop the hook from running, or make it import attacker
+  Python — without touching the `hooks` block.
+- **Editing the hook's own file.** The guard does not protect `~/.claude/hooks/rc_env_guard.py`;
+  overwriting or deleting it disarms the guard while `settings.json` still shows it registered.
+- **Deleting or moving settings.json via Bash** (`rm`, `mv` to elsewhere) removes the
+  registration; only writes *into* the file are judged.
+- **Registration forms the recognizer doesn't know** (a version-suffixed interpreter it hasn't
+  been taught, a matcher spelled with commas or spaces) leave the self-registration invariant off.
+- **Crafted, very long commands** can make the Bash regexes slow enough to hit the hook timeout.
+
+The value it does provide is against the *accident*: a telemetry opt-out pasted into settings by a
+human or an unsuspecting model, through the ordinary editing path. That is the case it opened with,
+and the one it reliably catches.
+
 ---
 
 ## Install
@@ -133,11 +160,16 @@ evaluation error exits **1** and surfaces as a non-blocking hook error. `Session
 `ConfigChange` are observational backstops: inspection failures are reported, but startup
 continues and a configuration change may already be on disk.
 
-### It also guards its own registration
+### It resists the common ways its registration gets dropped
 
-A guard you can quietly remove is not a guard. The hook treats **its own registration** as an
-invariant: an edit that drops an event, narrows the matcher so it no longer fires, points the
-command somewhere else, or replaces the file with broken JSON is refused.
+On the ordinary Edit/Write path, the hook treats **its own registration** as an invariant: an
+edit that drops an event, narrows the matcher to a form it recognizes as no longer firing, points
+the command at a different script, or replaces the file with broken JSON is refused. This is
+aimed at the accidental or structural case, not at a determined actor — the
+[known bypasses](#known-ways-a-determined-actor-gets-past-it) above (editing the hook's own file,
+env/interpreter tricks, deleting settings via Bash, unrecognized registration forms) are real and
+are not caught here. The invariant reduces how easily the guard is *accidentally* removed; it does
+not make it tamper-proof.
 
 `SessionStart` reads the **process environment first**, so a variable that arrived through any
 path — settings, shell profile, `--settings`, managed policy — is caught even if the file looks clean.
@@ -147,10 +179,11 @@ path — settings, shell profile, `--settings`, managed policy — is caught eve
 ## Tests
 
 ```bash
-python3 tests/test_rc_env_guard.py   # 90 cases: the guard's decision contract
+python3 tests/test_rc_env_guard.py   # 98 cases: the guard's decision contract
 python3 tests/test_compat.py         #  9 cases: the interpreter-floor contract
-python3 tests/test_installer.py      # 51 cases: the installer, incl. spaces-in-path,
-                                     #           repair, backups, move-then-uninstall
+python3 tests/test_installer.py      # 63 cases: the installer, incl. spaces/metachars
+                                     #           in the path, repair, backups,
+                                     #           co-located hooks, move-then-uninstall
 ```
 
 The main suite checks its own coverage against an expected-ID manifest, so deleting a case

@@ -267,6 +267,68 @@ with tempfile.TemporaryDirectory() as td:
           code == 0 and not guard_commands(mdata), out[:100])
     check("move: hook copy removed", not dest_for(moved).exists())
 
+    # --- a settings dir path with a shell metacharacter (found in review: a
+    #     shlex.quote'd `&` broke command recognition, not just spaces) --------
+    meta = fixture(tmp, EXISTING, name="R&D")
+    code, out = run(meta)
+    mdata = json.loads(meta.read_text())
+    check("meta path: install exit 0", code == 0, out[:80])
+    check("meta path: registered command launches (exit 1 on empty payload)",
+          bool(guard_commands(mdata)) and launch(guard_commands(mdata)[0]) == 1)
+    code, out = run(meta)   # recognizes its own registration -> idempotent
+    check("meta path: second run is idempotent (recognizes its own registration)",
+          code == 0 and "Nothing to do" in out, out[:100])
+    mmod = load_module(dest_for(meta), "rc_env_guard_installed_meta")
+    check("meta path: hook's registration_problem() accepts the result",
+          mmod.registration_problem(json.loads(meta.read_text())) is None)
+
+    # --- co-located third-party handler is preserved (handler granularity) ---
+    colo = fixture(tmp, None, name="colocated")
+    dcolo = dest_for(colo)
+    dcolo.parent.mkdir(parents=True, exist_ok=True)
+    dcolo.write_bytes(HOOK_SOURCE.read_bytes())
+    other_cmd = "python3 /usr/local/bin/secret_scan.py"
+    colo.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "Edit|Write|MultiEdit|Bash", "hooks": [
+            {"type": "command", "command": "python3 %s" % dcolo},
+            {"type": "command", "command": other_cmd}]}]}}), encoding="utf-8")
+    code, out = run(colo, "--uninstall")
+    cdata = json.loads(colo.read_text())
+    chandlers = [h.get("command") for e in cdata["hooks"]["PreToolUse"]
+                 for h in e.get("hooks", [])]
+    check("co-located: our handler removed", not guard_commands(cdata))
+    check("co-located: the other handler in the same entry survives",
+          other_cmd in chandlers, str(chandlers))
+
+    # --- a malformed (non-dict) handler must not crash with a traceback ------
+    nd = fixture(tmp, None, name="nondict")
+    nd.write_text('{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [null]}]}}',
+                  encoding="utf-8")
+    code, out = run(nd)
+    check("non-dict handler: no Python traceback",
+          "Traceback" not in out, out[:120])
+    check("non-dict handler: exit 0, three events registered",
+          code == 0 and all(ev in json.loads(nd.read_text()).get("hooks", {})
+                            for ev in ("PreToolUse", "SessionStart", "ConfigChange")),
+          out[:120])
+
+    # --- a symlinked settings.json is updated in place, not replaced ---------
+    realdir = tmp / "realsettings" / ".claude"
+    realdir.mkdir(parents=True)
+    realfile = realdir / "settings.json"
+    realfile.write_text(json.dumps(EXISTING), encoding="utf-8")
+    linkdir = tmp / "linked" / ".claude"
+    linkdir.mkdir(parents=True)
+    linkpath = linkdir / "settings.json"
+    os.symlink(realfile, linkpath)
+    code, out = run(linkpath)
+    check("symlink settings: install exit 0", code == 0, out[:80])
+    check("symlink settings: path is still a symlink (not replaced by a file)",
+          os.path.islink(linkpath))
+    check("symlink settings: the real target received the registrations",
+          all(ev in json.loads(realfile.read_text()).get("hooks", {})
+              for ev in ("PreToolUse", "SessionStart", "ConfigChange")))
+
     # --- backups cannot collide within one second ---------------------------
     inst = load_module(INSTALLER, "installer_under_test")
     original = fixture(tmp, {"generation": 0}, name="backup")
@@ -278,6 +340,8 @@ with tempfile.TemporaryDirectory() as td:
           json.loads(b1.read_text()).get("generation") == 0)
     check("backup collision: second backup keeps generation 1",
           json.loads(b2.read_text()).get("generation") == 1)
+    check("backup: created 0600, not the source's mode (no world-readable secret copy)",
+          (b1.stat().st_mode & 0o777) == 0o600, oct(b1.stat().st_mode & 0o777))
 
     # --- fault injection: does the suite actually detect a destructive install?
     repo = tmp / "repo"

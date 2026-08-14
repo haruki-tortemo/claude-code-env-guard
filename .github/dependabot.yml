@@ -1,0 +1,8 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions current via reviewable PRs instead of
+  # silently by an upstream tag move.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

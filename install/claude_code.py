@@ -119,8 +119,22 @@ def matcher_tokens(matcher) -> set:
     return {t.strip() for t in re.split(r"[|,]", str(matcher or "")) if t.strip()}
 
 
+_QUOTED_SPAN = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def has_shell_control(command: str) -> bool:
+    """Shell control/expansion OUTSIDE any quoted span.
+
+    Found in review: screening the raw command string rejected a perfectly safe
+    `shlex.quote`d path that merely contains `&`/`;`/`|` (a directory named
+    `R&D`), so the installer could not recognize its own registration. Quoted
+    spans carry no shell meaning, so blank them out before testing.
+    """
+    return bool(SHELL_CONTROL.search(_QUOTED_SPAN.sub("", command)))
+
+
 def command_argv(command):
-    if not isinstance(command, str) or SHELL_CONTROL.search(command):
+    if not isinstance(command, str) or has_shell_control(command):
         return None
     try:
         return shlex.split(command, comments=True)
@@ -128,22 +142,52 @@ def command_argv(command):
         return None
 
 
-def entry_is_ours(entry: dict) -> bool:
-    """Does any handler in this entry reference our script by basename?
+def handler_is_ours(handler) -> bool:
+    """Does this single handler invoke our script (by basename)?
 
-    Deliberately loose: uninstall and repair must also catch stale or broken
-    registrations (old paths, missing quoting) that a strict check would skip.
+    Loose on purpose so uninstall/repair catch stale entries (old paths, a
+    different interpreter) - but defensive against non-dict handlers, which a
+    hand-edited or third-party settings file may contain.
     """
-    for hook in entry.get("hooks", []) or []:
-        command = hook.get("command")
-        if not isinstance(command, str):
-            continue
-        argv = command_argv(command)
-        tokens = argv if argv is not None else command.split()
-        for token in tokens:
-            if token.split("/")[-1] == HOOK_NAME or token.endswith("/" + HOOK_NAME):
-                return True
-    return False
+    if not isinstance(handler, dict):
+        return False
+    command = handler.get("command")
+    if not isinstance(command, str):
+        return False
+    argv = command_argv(command)
+    tokens = argv if argv is not None else command.split()
+    return any(os.path.basename(t) == HOOK_NAME for t in tokens)
+
+
+def entry_is_ours(entry: dict) -> bool:
+    """Does any handler in this entry reference our script?"""
+    if not isinstance(entry, dict):
+        return False
+    handlers = entry.get("hooks")
+    return isinstance(handlers, list) and any(handler_is_ours(h) for h in handlers)
+
+
+def strip_our_handlers(entries: list):
+    """Return (new_entries, removed_count), removing only OUR handlers.
+
+    Handler granularity, not entry granularity: a settings entry that groups our
+    handler together with the user's own hook keeps the user's hook. Found in
+    review: entry-granularity removal silently deleted co-located third-party
+    hooks and only reported a count.
+    """
+    new_entries = []
+    removed = 0
+    for e in entries:
+        handlers = e.get("hooks") if isinstance(e, dict) else None
+        if isinstance(handlers, list) and any(handler_is_ours(h) for h in handlers):
+            kept = [h for h in handlers if not handler_is_ours(h)]
+            removed += len(handlers) - len(kept)
+            if kept:                       # other handlers remain -> keep the entry
+                new_entries.append({**e, "hooks": kept})
+            # else: entry held only our handler -> drop it
+        else:
+            new_entries.append(e)
+    return new_entries, removed
 
 
 def entry_is_healthy(entry: dict, needed: str, dest: Path) -> bool:
@@ -191,17 +235,18 @@ def install(data: dict, dest: Path) -> list:
         entries = hooks.setdefault(event, [])
         if not isinstance(entries, list):
             raise Abort('"hooks.%s" is not a list. Nothing was changed.' % event)
-        ours = [e for e in entries if isinstance(e, dict) and entry_is_ours(e)]
-        if any(entry_is_healthy(e, matcher, dest) for e in ours):
+        if any(isinstance(e, dict) and entry_is_healthy(e, matcher, dest) for e in entries):
             continue
-        for stale in ours:
-            entries.remove(stale)
+        # Not healthy: strip only our (stale) handlers, keep co-located ones,
+        # then append a correct fresh registration.
+        new_entries, removed = strip_our_handlers(entries)
         handler = {"type": "command", "command": guard_command(dest), "timeout": timeout}
         if status:
             handler["statusMessage"] = status
-        entries.append({"matcher": matcher, "hooks": [handler]})
-        verb = "repaired" if ours else "added"
-        changes.append("%s %s (matcher: %s)" % (verb, event, matcher))
+        new_entries.append({"matcher": matcher, "hooks": [handler]})
+        hooks[event] = new_entries
+        changes.append("%s %s (matcher: %s)"
+                       % ("repaired" if removed else "added", event, matcher))
     return changes
 
 
@@ -214,12 +259,11 @@ def uninstall(data: dict) -> list:
         entries = hooks.get(event)
         if not isinstance(entries, list):
             continue
-        kept = [e for e in entries if not (isinstance(e, dict) and entry_is_ours(e))]
-        if len(kept) != len(entries):
-            changes.append("removed %d entr%s from %s"
-                           % (len(entries) - len(kept),
-                              "y" if len(entries) - len(kept) == 1 else "ies", event))
-            hooks[event] = kept
+        new_entries, removed = strip_our_handlers(entries)
+        if removed:
+            changes.append("removed %d handler%s from %s"
+                           % (removed, "" if removed == 1 else "s", event))
+            hooks[event] = new_entries
     return changes
 
 
@@ -237,46 +281,75 @@ def hook_copy_change(dest: Path):
 
 
 def copy_hook(dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".rc-env-guard-", suffix=".tmp")
+    # Follow a symlink: write the real file so a dotfiles-managed hook path is
+    # updated in place rather than replaced with a regular file.
+    real = Path(os.path.realpath(str(dest)))
+    real.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".rc-env-guard-", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(HOOK_SOURCE.read_bytes())
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, dest)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, real)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
 
 
-def unique_backup_path(path: Path) -> Path:
-    """Create the backup file exclusively so a same-second rerun cannot reuse
-    (and overwrite) an earlier backup's name."""
+def unique_backup_open(path: Path):
+    """Exclusively create the backup and return (fd, path).
+
+    The fd is kept and written through, never reopened by name: a same-second
+    rerun cannot reuse the name (O_EXCL), and there is no window in which the
+    name could be swapped for a symlink between create and write.
+    """
     stamp = time.strftime("%Y%m%dT%H%M%S")
     n = 0
     while True:
         suffix = ".json.backup-%s" % stamp if n == 0 else ".json.backup-%s-%d" % (stamp, n)
         candidate = path.with_suffix(suffix)
         try:
-            os.close(os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
-            return candidate
+            fd = os.open(str(candidate), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            return fd, candidate
         except FileExistsError:
             n += 1
 
 
-def write_atomically(path: Path, data: dict) -> Path:
-    backup = unique_backup_path(path)
-    shutil.copy2(path, backup)
-    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".settings-", suffix=".tmp")
+def write_atomically(path: Path, data: dict, known_mtime_ns: int = None) -> Path:
+    # Operate on the real file so a symlinked settings.json is updated in place,
+    # not converted to a regular file that detaches the user's dotfiles copy.
+    real = Path(os.path.realpath(str(path)))
+    orig_mode = os.stat(real).st_mode & 0o777
+
+    # Backup: write through the exclusively-created fd, kept at 0600. Never
+    # reopen by name (no symlink race), never copystat (no world-readable copy
+    # of a file that may hold API keys).
+    backup_fd, backup = unique_backup_open(real)
+    with os.fdopen(backup_fd, "wb") as bf, open(real, "rb") as src:
+        shutil.copyfileobj(src, bf)
+        bf.flush()
+        os.fsync(bf.fileno())
+
+    # A concurrent writer (Claude Code itself, or a second installer) must not
+    # be silently overwritten. If the file changed since we read it, abort.
+    if known_mtime_ns is not None and os.stat(real).st_mtime_ns != known_mtime_ns:
+        raise Abort(
+            "%s changed on disk while the installer was running.\n"
+            "Nothing was written (a backup was taken at %s). Re-run to retry."
+            % (real, backup))
+
+    fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".settings-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False, sort_keys=True)
             fh.write("\n")
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)          # atomic on POSIX
+        os.chmod(tmp, orig_mode)        # keep the user's mode, don't silently change it
+        os.replace(tmp, real)           # atomic on POSIX
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
@@ -292,7 +365,10 @@ def main() -> int:
     parser.add_argument("--settings", type=Path, default=DEFAULT_SETTINGS)
     args = parser.parse_args()
 
-    if not SETTINGS_RE.search(args.settings.as_posix()):
+    # Normalize (collapse `//`, `/.`) before matching so the gate stays in
+    # lockstep with the hook's own path check.
+    settings_posix = Path(os.path.normpath(str(args.settings))).as_posix()
+    if not SETTINGS_RE.search(settings_posix):
         print(
             "Refusing target %s.\n"
             "The guard only inspects .claude/settings.json and "
@@ -310,9 +386,13 @@ def main() -> int:
 
     try:
         data = load_settings(args.settings)
+        mtime_ns = os.stat(os.path.realpath(str(args.settings))).st_mtime_ns
         if args.uninstall:
             changes = uninstall(data)
-            if dest.exists():
+            # Only remove the hook file if we actually removed registrations for
+            # it -- otherwise a run against an unrelated checkout would delete a
+            # file that other, still-present registrations point at.
+            if changes and dest.exists():
                 changes.append("remove hook file %s" % dest)
             copy_change = None
         else:
@@ -322,6 +402,13 @@ def main() -> int:
                 changes.append(copy_change)
     except Abort as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+    except Exception as exc:                                    # noqa: BLE001
+        # The project promises "nothing was changed" on a file it cannot handle
+        # (e.g. a malformed but JSON-valid handler). Convert an unexpected error
+        # into that contract instead of a traceback: nothing has been written yet.
+        print("Could not process %s (%s: %s). Nothing was changed."
+              % (args.settings, type(exc).__name__, exc), file=sys.stderr)
         return 1
 
     verb = "uninstall" if args.uninstall else "install"
@@ -338,23 +425,27 @@ def main() -> int:
         return 0
 
     backup = None
-    if args.uninstall:
-        settings_changes = [c for c in changes if not c.startswith("remove hook file")]
-        if settings_changes:
-            backup = write_atomically(args.settings, data)
-        if dest.exists():
-            try:
-                os.remove(str(dest))
-            except OSError as exc:
-                print("Warning: could not remove %s (%s) -- remove it by hand."
-                      % (dest, exc.__class__.__name__), file=sys.stderr)
-    else:
-        # Copy the hook first: the registration must never point at a missing file.
-        if copy_change:
-            copy_hook(dest)
-        settings_changes = [c for c in changes if c is not copy_change]
-        if settings_changes:
-            backup = write_atomically(args.settings, data)
+    try:
+        if args.uninstall:
+            settings_changes = [c for c in changes if not c.startswith("remove hook file")]
+            if settings_changes:
+                backup = write_atomically(args.settings, data, mtime_ns)
+            if changes and dest.exists():
+                try:
+                    os.remove(str(dest))
+                except OSError as exc:
+                    print("Warning: could not remove %s (%s) -- remove it by hand."
+                          % (dest, exc.__class__.__name__), file=sys.stderr)
+        else:
+            # Copy the hook first: the registration must never point at a missing file.
+            if copy_change:
+                copy_hook(dest)
+            settings_changes = [c for c in changes if c is not copy_change]
+            if settings_changes:
+                backup = write_atomically(args.settings, data, mtime_ns)
+    except Abort as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
 
     print("%sed rc-env-guard in %s:" % (verb.capitalize(), args.settings))
     for change in changes:
