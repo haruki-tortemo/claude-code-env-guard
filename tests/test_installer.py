@@ -217,12 +217,11 @@ with tempfile.TemporaryDirectory() as td:
                  "hooks": [handler]}
         return {"hooks": {"PreToolUse": [entry]}}
 
+    # These are genuinely OUR broken registration (they execute our dest): repair.
     forms = (
         ("async-true", dict(async_true=True)),
         ("matcher-shrink", dict(matcher="Bash")),
-        ("shell-or-true", dict(cmd="python3 {d} || true")),
         ("type-missing", dict(drop_type=True)),
-        ("argv-decoy", dict(cmd="python3 -c 'pass' {d}")),
     )
     for label, mut in forms:
         path = fixture(tmp, None, name="repair-" + label)
@@ -239,6 +238,47 @@ with tempfile.TemporaryDirectory() as td:
         check("repair %s: result passes the hook's registration_problem()" % label,
               mod.registration_problem(after) is None,
               str(mod.registration_problem(after)))
+
+    # Commands that do NOT execute our dest (our path is only an argument, or the
+    # exit code is swallowed) are ambiguous, not ours: leave them, add a fresh
+    # registration alongside. Deleting them would risk a third party's hook.
+    preserve = (
+        ("echo-arg", "echo {d}"),                 # our path is just an echo arg
+        ("argv-decoy", "python3 -c 'pass' {d}"),  # -c script runs, {d} is argv[1]
+        ("shell-or-true", "python3 {d} || true"),  # exit 2 swallowed; ambiguous form
+    )
+    for label, tmpl in preserve:
+        path = fixture(tmp, None, name="preserve-" + label)
+        d = dest_for(path)
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.write_bytes(HOOK_SOURCE.read_bytes())
+        orig_cmd = tmpl.format(d=d)
+        path.write_text(json.dumps(variant_settings(d, cmd=orig_cmd), indent=2),
+                        encoding="utf-8")
+        code, out = run(path)
+        after = json.loads(path.read_text())
+        cmds = [h.get("command") for e in after["hooks"]["PreToolUse"]
+                for h in e.get("hooks", [])]
+        mod = load_module(d, "rc_env_guard_installed_preserve_" + label.replace("-", "_"))
+        check("preserve %s: our own registration added (not 'repaired')" % label,
+              code == 0 and "added PreToolUse" in out, out[:120])
+        check("preserve %s: the ambiguous handler is left untouched" % label,
+              orig_cmd in cmds, str(cmds))
+        check("preserve %s: result passes registration_problem()" % label,
+              mod.registration_problem(after) is None)
+
+    # And uninstall must not delete a command that merely mentions our path.
+    echo_only = fixture(tmp, None, name="uninstall-echo-only")
+    ed = dest_for(echo_only)
+    echo_cmd = "echo %s" % ed
+    echo_only.write_text(json.dumps(variant_settings(ed, cmd=echo_cmd), indent=2),
+                         encoding="utf-8")
+    code, out = run(echo_only, "--uninstall")
+    eafter = json.loads(echo_only.read_text())
+    ecmds = [h.get("command") for e in eafter["hooks"].get("PreToolUse", [])
+             for h in e.get("hooks", [])]
+    check("uninstall: a non-executing mention of our path is NOT removed",
+          echo_cmd in ecmds, str(ecmds))
 
     # A same-basename hook at a DIFFERENT path is not ours: leave it, report it,
     # and add our own registration alongside (do not delete a third party's hook).

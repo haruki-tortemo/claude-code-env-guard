@@ -143,27 +143,6 @@ def command_argv(command):
         return None
 
 
-def handler_is_ours(handler, dest: Path) -> bool:
-    """Does this single handler invoke OUR installed copy (by resolved path)?
-
-    Resolved-path, not basename. Found in review: matching the basename
-    `rc_env_guard.py` anywhere in the command also deleted a same-named
-    third-party hook at a different path (`/opt/vendor/rc_env_guard.py`). A
-    command token must resolve to the stable dest for the handler to be ours;
-    a different path with the same basename is left alone. Defensive against
-    non-dict handlers, which a hand-edited settings file may contain.
-    """
-    if not isinstance(handler, dict):
-        return False
-    command = handler.get("command")
-    if not isinstance(command, str):
-        return False
-    dest_real = _resolve(dest)
-    argv = command_argv(command)
-    tokens = argv if argv is not None else command.split()
-    return any(_resolve(t) == dest_real for t in tokens)
-
-
 def _resolve(token) -> str:
     try:
         return os.path.realpath(os.path.expanduser(str(token)))
@@ -171,12 +150,44 @@ def _resolve(token) -> str:
         return ""
 
 
-def foreign_same_basename_paths(data: dict, dest: Path) -> list:
-    """Registrations that name our script's basename but resolve elsewhere.
+def execution_target(command) -> str:
+    """The single script this command would EXECUTE, or None if the form is not
+    a plain `<script>` / `<interpreter> <script>`.
 
-    We do NOT touch these (they may be a legitimate third-party hook, or a
-    decoy). We report them so the operator can decide - the tool's whole point
-    is to not be silent.
+    Mirrors the hook's own command_runs_guard extraction so the two agree.
+    Found in review: comparing *any* argv token let `echo <our path>` (which
+    merely passes our path as an argument, never executing it) be treated as
+    ours and deleted. Only the execution target counts; anything else is
+    ambiguous and left untouched, matching the "do not break other hooks"
+    priority.
+    """
+    argv = command_argv(command)
+    if not argv:
+        return None
+    if len(argv) == 1:
+        return argv[0]
+    if len(argv) == 2 and os.path.basename(argv[0]) in INTERPRETERS:
+        return argv[1]
+    return None
+
+
+def handler_is_ours(handler, dest: Path) -> bool:
+    """Does this single handler EXECUTE our installed copy (by resolved path)?
+
+    A different path with the same basename, or a command that merely mentions
+    our path as an argument, is not ours. Defensive against non-dict handlers.
+    """
+    if not isinstance(handler, dict):
+        return False
+    target = execution_target(handler.get("command"))
+    return target is not None and _resolve(target) == _resolve(dest)
+
+
+def foreign_same_basename_paths(data: dict, dest: Path) -> list:
+    """Handlers that EXECUTE our script's basename from a different path.
+
+    We do NOT touch these (a legitimate third-party hook, or a decoy). We report
+    them so the operator can decide - the tool's whole point is to not be silent.
     """
     dest_real = _resolve(dest)
     found = []
@@ -188,12 +199,11 @@ def foreign_same_basename_paths(data: dict, dest: Path) -> list:
             handlers = e.get("hooks") if isinstance(e, dict) else None
             for h in handlers if isinstance(handlers, list) else []:
                 command = h.get("command") if isinstance(h, dict) else None
-                if not isinstance(command, str):
-                    continue
-                argv = command_argv(command)
-                for t in (argv if argv is not None else command.split()):
-                    if os.path.basename(t) == HOOK_NAME and _resolve(t) != dest_real:
-                        found.append(t)
+                target = execution_target(command)
+                if (target is not None
+                        and os.path.basename(target) == HOOK_NAME
+                        and _resolve(target) != dest_real):
+                    found.append(target)
     return sorted(set(found))
 
 
@@ -241,25 +251,15 @@ def entry_is_healthy(entry: dict, needed: str, dest: Path) -> bool:
         return False
     if not matcher_tokens(entry.get("matcher")) >= matcher_tokens(needed):
         return False
+    dest_real = _resolve(dest)
     for hook in entry.get("hooks", []) or []:
         if not isinstance(hook, dict):
             continue
         if hook.get("type") != "command" or hook.get("async") is True:
             continue
-        argv = command_argv(hook.get("command"))
-        if not argv:
-            continue
-        if len(argv) == 1:
-            target = argv[0]
-        elif len(argv) == 2 and argv[0].split("/")[-1] in INTERPRETERS:
-            target = argv[1]
-        else:
-            continue
-        try:
-            if Path(os.path.expanduser(target)).resolve() == dest.resolve():
-                return True
-        except OSError:
-            continue
+        target = execution_target(hook.get("command"))
+        if target is not None and _resolve(target) == dest_real:
+            return True
     return False
 
 
