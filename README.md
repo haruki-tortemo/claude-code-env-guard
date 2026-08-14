@@ -22,15 +22,23 @@ Four variables kill Remote Control. The value semantics are **not** what you wou
 | `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` | kills | **kills** | safe |
 
 > **`DISABLE_TELEMETRY=0` still kills it.** Setting it to "off" is not the same as not setting it.
-> This is measured behaviour, not documented behaviour — we found it by bisecting a broken config.
+> This is measured behavior, not documented behavior — we found it by bisecting a broken config.
 
 Any value we have not measured is treated as killing (fail-closed).
 
+What happens depends on the event that catches it:
+
+| Event | What the guard does with these four |
+|---|---|
+| `PreToolUse` | blocks the write before it lands |
+| `ConfigChange` | blocks applying the already-written change to the current session |
+| `SessionStart` | warns only (startup is never blocked) |
+
 ## What it warns about
 
-Eight variables reroute Claude away from `api.anthropic.com`. Remote Control dies the same way,
-but these have legitimate uses (Bedrock, Vertex, Foundry, custom gateways), so the hook
-**warns at session start instead of blocking**:
+Eight variables change the endpoint, transport, provider, or authentication mode in ways that
+make Remote Control unavailable. They have legitimate uses (Bedrock, Vertex, Foundry, custom
+gateways), so the hook **warns at session start instead of blocking**:
 
 `ANTHROPIC_API_KEY` · `ANTHROPIC_BASE_URL` · `ANTHROPIC_UNIX_SOCKET` ·
 `CLAUDE_CODE_USE_BEDROCK` · `CLAUDE_CODE_USE_VERTEX` · `CLAUDE_CODE_USE_FOUNDRY` ·
@@ -52,14 +60,16 @@ Blocking these would train you to route around the hook. Warning is the honest l
 Concretely:
 
 - **Arbitrary code execution is out of scope.** `python3 -c "..."` and `python3 - <<EOF` can write
-  whatever they like to your settings. Your `settings.json` almost certainly allows `Bash(python3 *)`,
-  so a model that wants to route around this hook can. We do not claim otherwise, and we will not
-  add parsers chasing that — the line cannot be crossed from inside a hook.
+  whatever they like to your settings. If Python execution is allowed in your permission settings,
+  a script can write the settings file in ways this hook cannot reliably inspect. We do not claim
+  otherwise, and we will not add parsers chasing that — the line cannot be crossed from inside a hook.
 - **It guards one specific failure mode**: an environment variable, written through the normal
   editing path, that silently disables a feature.
 - **It is not a sandbox, a permission system, or a destructive-command guard.**
-  If you want the latter, [dcg](https://github.com/Dicklesworthstone/destructive_command_guard)
-  is a much larger and more thorough project, and it composes fine with this one.
+  For broader destructive-command protection, see
+  [dcg](https://github.com/Dicklesworthstone/destructive_command_guard) — it addresses a
+  different and much larger problem space. Both installers preserve existing hooks, but this
+  project does not test the two together.
 
 We state this because a guard that overstates its coverage is worse than no guard —
 you stop looking for the thing it claims to handle.
@@ -73,16 +83,27 @@ refuses to run — and blocks, rather than warns:
 [docs/why-the-version-check-blocks.md](docs/why-the-version-check-blocks.md).
 
 ```bash
-git clone <repo-url> && cd <repo> && python3 install/claude_code.py
+git clone https://github.com/haruki-tortemo/claude-code-env-guard.git
+cd claude-code-env-guard
+python3 install/claude_code.py --dry-run
+python3 install/claude_code.py
 ```
 
-The installer **merges** into your existing `~/.claude/settings.json`. It does not overwrite it:
+The installer copies the hook to a stable location next to your settings file
+(`~/.claude/hooks/rc_env_guard.py`) and registers that copy — you can move or delete the
+checkout afterwards. It **merges** into your existing `~/.claude/settings.json`. It does not
+overwrite it:
 
 - Existing hooks are preserved.
 - If the file is missing, unreadable, or not valid JSON, the installer **stops and reports**
   rather than replacing it.
-- A timestamped backup is written before any change.
-- Re-running is idempotent.
+- A uniquely named backup is written before any change (two runs in the same second cannot
+  clobber each other's backups).
+- Re-running is idempotent, and a half-broken earlier registration (a narrowed matcher,
+  `async: true`, a dropped event) is repaired rather than accepted.
+- `--settings` only accepts `.claude/settings.json` / `.claude/settings.local.json` — the
+  only paths the guard actually watches. Installing anywhere else would report success while
+  guarding nothing, so it is refused.
 
 Restart Claude Code afterwards.
 
@@ -107,8 +128,10 @@ The hook registers on three events, and **needs all three**:
 To block, it exits **2** with the reason on `stderr`. That is Claude Code's documented contract:
 exit 2 discards stdout and returns stderr to the model.
 
-**Undecidable input is not silently allowed.** A malformed payload or an internal error exits **1**
-with a message — the operation proceeds, but it surfaces as a hook error instead of a silent success.
+**Undecidable input is not silently allowed.** For `PreToolUse`, malformed input or an internal
+evaluation error exits **1** and surfaces as a non-blocking hook error. `SessionStart` and
+`ConfigChange` are observational backstops: inspection failures are reported, but startup
+continues and a configuration change may already be on disk.
 
 ### It also guards its own registration
 
@@ -124,14 +147,18 @@ path — settings, shell profile, `--settings`, managed policy — is caught eve
 ## Tests
 
 ```bash
-python3 tests/test_rc_env_guard.py
+python3 tests/test_rc_env_guard.py   # 90 cases: the guard's decision contract
+python3 tests/test_compat.py         #  9 cases: the interpreter-floor contract
+python3 tests/test_installer.py      # 51 cases: the installer, incl. spaces-in-path,
+                                     #           repair, backups, move-then-uninstall
 ```
 
-90 cases. The suite checks its own coverage against an expected-ID manifest, so deleting a case
-fails the run rather than quietly shrinking the denominator.
+The main suite checks its own coverage against an expected-ID manifest, so deleting a case
+fails the run rather than quietly shrinking the denominator. CI runs all three suites on
+Python 3.9 and a current Python.
 
-It also **injects faults**: it disables parts of the hook and asserts the suite goes red. A test
-that stays green when you break the thing it tests is not a test.
+The suites also **inject faults**: they disable parts of the hook or installer and assert the
+run goes red. A test that stays green when you break the thing it tests is not a test.
 
 ### What we learned building this (and got wrong twice)
 

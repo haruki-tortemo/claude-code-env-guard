@@ -1,0 +1,20 @@
+# Python 3.9 here is a guard, not a nicety: the runtime version check in the
+# hook can only refuse AFTER the interpreter parsed the module, so syntax that
+# 3.9 cannot parse would crash the guard open. This job is what prevents such
+# a release. See docs/why-the-version-check-blocks.md.
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: python tests/test_rc_env_guard.py
+      - run: python tests/test_compat.py
+      - run: python tests/test_installer.py

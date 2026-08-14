@@ -8,20 +8,22 @@ cannot parse it, and it crashes on import. Claude Code reports a hook error,
 the tool call proceeds, and you are unprotected — while your settings still say
 the hook is installed.
 
-We measured exactly that. The same `git add -A` was blocked under Python 3.14
-(exit 2) and allowed under macOS's `/usr/bin/python3` 3.9.6 (exit 1, crash on a
-`str | None` annotation). Nothing in the UI distinguished the two.
+We measured exactly that during development: the same blocked operation was
+denied under Python 3.14 (exit 2) and allowed under macOS's `/usr/bin/python3`
+3.9.6 (exit 1, a crash on a `str | None` annotation). Nothing in the UI
+distinguished the two.
 
-Two independent fixes, both required
-------------------------------------
-1. `from __future__ import annotations` in every hook module, so PEP 604
-   annotations are lazy and the file parses back to 3.7. That removes the
-   common cause.
-2. This check, so a *future* edit that reintroduces too-new syntax cannot fail
-   open silently.
+Two guards, different failure modes
+-----------------------------------
+1. `from __future__ import annotations` in every hook module keeps the current
+   annotations compatible with 3.9.
+2. This check gives a clear, blocking refusal - but only after the interpreter
+   has parsed the module. Syntax that 3.9 cannot parse crashes before any line
+   runs, so the guard for THAT failure mode is the Python 3.9 CI job, which
+   runs the full test suites on a real 3.9 interpreter.
 
-Neither alone is enough: (1) does not stop the next person writing 3.10+ syntax,
-and (2) alone would deny everything on a stock macOS Python.
+Both are required: CI prevents incompatible releases; this check gives users an
+actionable error when a compatible release meets an unsupported interpreter.
 
 Why exit 2 and not exit 1
 -------------------------

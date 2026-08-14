@@ -29,7 +29,7 @@ Unmeasured values ("false", etc.) are treated as killing (fail-closed).
 ## The set is not a permanent fact
 Found in review: an earlier version hardcoded "the three variables I knew about" -
 the set was bounded by the author's knowledge, not by measurement. External
-behaviour changes with releases. After updating Claude Code, re-enumerate: set each
+behavior changes with releases. After updating Claude Code, re-enumerate: set each
 candidate variable to "1", "0", and empty, run `claude remote-control --help`, and
 let the CLI itself name the offending variable in its refusal message.
 
@@ -241,47 +241,37 @@ def deny(reason: str) -> None:
 def report_error(reason: str) -> None:
     """Undecidable. Does not block the operation, but never stays silent
     (exit 1 surfaces as a hook error)."""
-    print(f"⚠️ rc-env-guard: could not evaluate this operation ({reason}). "
-          "A human needs to confirm that no Remote-Control-killing env variable "
-          "slipped in.", file=sys.stderr)
+    print(f"⚠️ rc-env-guard could not evaluate this operation: {reason}. "
+          "The operation was not blocked. Verify the settings file before "
+          "continuing.", file=sys.stderr)
     sys.exit(ERROR_EXIT)
 
 
-DENY_TEMPLATE = """⛔ rc-env-guard: {what}
+DENY_TEMPLATE = """⛔ rc-env-guard blocked this change.
 
-Why this is blocked: Claude Code's Remote Control depends on feature-flag
-evaluation, and any one of four env variables **silently kills PC-to-phone
-sync**. `remoteControlAtStartup: true` stays in the file, so the config looks
-correct while sync is dead. This guard exists because exactly that once cost
-three days: a telemetry opt-out meant for an unrelated tool landed in
-settings.json and Remote Control died without a single error message.
+Reason: {what}
 
-What to do instead:
-   Silence another tool's telemetry -> use that tool's own opt-out switch, not
-                                       a global variable in Claude Code settings
-   Reduce Claude Code's own traffic -> `DISABLE_ERROR_REPORTING=1` (measured:
-                                       Remote Control survives it)
-   Genuinely give up Remote Control -> the human owner must edit settings.json
-                                       by hand, outside this session. Verbal
-                                       approval to the model does not lift this.
+This setting disables Claude Code Remote Control without removing
+`remoteControlAtStartup`, so the configuration can look valid while phone sync
+fails.
 
-The four variables (measured against v2.1.226): DO_NOT_TRACK and
-DISABLE_GROWTHBOOK are safe at "0"; DISABLE_TELEMETRY and
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC kill **even at "0"**.
-Details: README.md ("What it blocks")"""
+Choose one:
+- To disable telemetry for another tool, use that tool's dedicated setting.
+- To reduce Claude Code error reporting, use `DISABLE_ERROR_REPORTING=1`
+  (Remote Control survives it; tested with Claude Code 2.1.226).
+- To disable Remote Control intentionally, edit settings.json yourself outside
+  Claude Code. A chat instruction cannot bypass this guard.
 
-BASH_TEMPLATE = """⛔ rc-env-guard: blocked a Bash write to `{path}`.
+Value details: README.md#what-it-blocks"""
 
-**No variable name was checked. Bash writes into settings are refused as such.**
-Why:
-  1. Split the write in two (`printf ... > /tmp/x`, then `mv`) and the variable
-     name no longer sits next to the destination - name-based checks pass it.
-  2. Replacing the whole settings file can also erase this guard's own hook
-     registration - a guard you can quietly remove protects nothing.
+BASH_TEMPLATE = """⛔ rc-env-guard blocked a direct Bash write to `{path}`.
 
--> Make settings changes with **Edit / Write** (the resulting JSON's env block
-   is evaluated semantically). Removing a dangerous variable also passes there.
-Details: README.md ("How it decides")"""
+The guard cannot safely verify the resulting `env` block or confirm that its
+own registration survives a direct shell write.
+
+Use Edit or Write instead; the guard evaluates the resulting JSON. Read-only
+commands and backups with settings.json as the source are allowed.
+Details: README.md#how-it-decides"""
 
 WARN_TEMPLATE = """⚠️ rc-env-guard (SessionStart): {vars} present in {where}.
 Remote Control dies silently with this: the phone app's device list stays empty
@@ -533,9 +523,8 @@ def join_line_continuations(command: str) -> str:
     token folded mid-word into two words: `~/.claude/sett\\<newline>ings.json`
     would read as `sett ings.json` and pass, while the real shell happily writes
     the file. We shipped exactly that bug: the space-replacement fix for the
-    misses above created three fresh false negatives the same day - and a
-    sibling guard in the same codebase had already hit this hole and fixed it by
-    removal. Check prior art before re-implementing "the obvious fix".
+    misses above created three fresh false negatives the same day. Hence
+    removal before tokenization, and the mid-word cases in the test suite.
 
     One divergence remains: backslash-newline inside single quotes is also
     removed here, which a real shell would keep. That divergence only ever makes

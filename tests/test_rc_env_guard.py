@@ -248,7 +248,7 @@ def main() -> int:  # noqa: C901
 
     print("\n--- Positive: Bash with settings as the write destination ---")
     case("deny-bash-mv", "mv (temp -> settings)", DENY,
-         bash("mv /tmp/rc-stage.json ~/.claude/settings.json"), expect_text="Edit / Write")
+         bash("mv /tmp/rc-stage.json ~/.claude/settings.json"), expect_text="Edit or Write")
     case("deny-bash-cp", "cp wholesale replacement", DENY,
          bash("cp /tmp/rc-stage.json ~/.claude/settings.json"))
     case("deny-bash-redirect", "echo redirect", DENY,
@@ -369,8 +369,7 @@ def main() -> int:  # noqa: C901
     # backslash-newline from the input stream (GNU Bash Reference Manual);
     # replacing it with a space turns a mid-word fold into two words - the hook
     # read `sett ings.json` and passed it while the real shell wrote the file.
-    # A sibling guard had already hit and fixed this exact hole by removal; the
-    # prior art was not consulted. Hence these three cases.
+    # Hence removal, and these three cases to keep it that way.
     case("deny-bash-linecont-midword", "line continuation: mid-word (sett\\<nl>ings)", DENY,
          bash('printf "{}" > ~/.claude/sett\\\nings.json'))
     case("deny-bash-linecont-midext", "line continuation: right before the extension", DENY,

@@ -24,9 +24,9 @@ Claude Code reports a hook *error* (exit 1) — and **the tool call proceeds**.
 You are unprotected, while your `settings.json` still says the hook is
 installed.
 
-We measured exactly this, with a sibling guard in the same codebase:
+We measured exactly this failure mode during development:
 
-- The same `git add -A` was **blocked** under Python 3.14 (exit 2)
+- the same blocked operation was **denied** under Python 3.14 (exit 2)
 - and **allowed** under macOS's stock `/usr/bin/python3` 3.9.6
   (exit 1 — a crash on a `str | None` annotation, which is 3.10+ syntax).
 
@@ -47,18 +47,22 @@ If the check cannot run, we do not let the write through. The refusal message
 states the interpreter in use and the exact ways to fix it, so this is a loud,
 actionable stop rather than a mystery.
 
-## Two independent fixes, both required
+## Three guards, three different failure modes
 
-1. **`from __future__ import annotations`** in the hook, so PEP 604
-   annotations (`str | None`) are lazy and the file parses back to much older
-   interpreters. This removes the *common* cause of the crash.
-2. **The version check itself**, so a future edit that reintroduces too-new
-   syntax elsewhere (a walrus, a `match`, a 3.10+ typing form in executed
-   code) cannot fail open silently.
+1. **`from __future__ import annotations`** keeps the current annotations
+   (`str | None`) compatible with Python 3.9.
+2. **The runtime version check** gives a clear, blocking refusal — but only
+   after the interpreter has parsed the module. It **cannot** protect against
+   syntax that Python 3.9 cannot parse: the interpreter parses the whole file
+   before executing the first line, so 3.10+ syntax anywhere in the module
+   crashes before the check ever runs.
+3. **The Python 3.9 CI job** (`.github/workflows/test.yml`) is the guard for
+   that parse-level failure mode: it runs all three test suites on a real
+   3.9 interpreter, so a release with incompatible syntax cannot ship green.
 
-Neither alone is enough: (1) does not stop the next contributor from writing
-3.10+ syntax in code that actually executes, and (2) alone would deny
-everything on a stock macOS Python.
+All three are required: CI prevents incompatible releases, while the runtime
+check gives users an actionable error when they invoke a compatible release
+with an unsupported interpreter.
 
 ## Why the check is inlined in the hook
 
@@ -81,8 +85,9 @@ reject: no f-strings in the failure path, no annotations, no walrus, no
 macOS ships 3.9.6 as `/usr/bin/python3`. Supporting it is a distribution
 requirement, not a nicety: hooks are launched via PATH resolution, and on a
 machine with no Homebrew/pyenv Python, the stock interpreter is what runs.
-The floor is the oldest interpreter we actually test against
-(`tests/test_compat.py` runs the contract on it, fault injection included).
+The floor is the oldest interpreter CI runs the full suites on;
+`tests/test_compat.py` exercises the refusal contract itself, fault injection
+included.
 
 ## If the check fires on your machine
 

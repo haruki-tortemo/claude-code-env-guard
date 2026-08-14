@@ -2,7 +2,7 @@
 """Contract tests for the interpreter floor check.
 
 A guard's own guard needs tests, or it is decoration. These assert the two
-behaviours that matter:
+behaviors that matter:
 
   - too old  -> exit 2 (block), with an actionable message on stderr
   - new enough -> returns, silently
