@@ -267,6 +267,36 @@ with tempfile.TemporaryDirectory() as td:
         check("preserve %s: result passes registration_problem()" % label,
               mod.registration_problem(after) is None)
 
+    # A differently-named SYMLINK that resolves to our copy is a registration the
+    # hook does not recognize (its basename is not rc_env_guard.py), so the
+    # installer must not call it "already installed" - it adds a fresh, real
+    # registration and the hook then agrees the guard is registered.
+    aliased = fixture(tmp, None, name="alias-symlink")
+    da = dest_for(aliased)
+    da.parent.mkdir(parents=True, exist_ok=True)
+    da.write_bytes(HOOK_SOURCE.read_bytes())
+    alias = aliased.parent / "alias.py"
+    os.symlink(da, alias)
+    alias_cmd = "python3 %s" % alias
+    matchers = {"PreToolUse": "Edit|Write|MultiEdit|Bash",
+                "SessionStart": "startup|resume|clear|compact|fork",
+                "ConfigChange": "user_settings|project_settings|local_settings|policy_settings"}
+    aliased.write_text(json.dumps({"hooks": {
+        ev: [{"matcher": m, "hooks": [{"type": "command", "command": alias_cmd}]}]
+        for ev, m in matchers.items()}}), encoding="utf-8")
+    code, out = run(aliased)
+    aadata = json.loads(aliased.read_text())
+    amod = load_module(da, "rc_env_guard_installed_alias")
+    acmds = [h.get("command") for e in aadata["hooks"]["PreToolUse"]
+             for h in e.get("hooks", [])]
+    check("alias symlink: NOT reported as already installed (fresh added)",
+          code == 0 and "Nothing to do" not in out and "added PreToolUse" in out, out[:120])
+    check("alias symlink: the alias registration is left untouched",
+          alias_cmd in acmds, str(acmds))
+    check("alias symlink: installer and hook now agree (registration_problem None)",
+          amod.registration_problem(aadata) is None,
+          str(amod.registration_problem(aadata)))
+
     # And uninstall must not delete a command that merely mentions our path.
     echo_only = fixture(tmp, None, name="uninstall-echo-only")
     ed = dest_for(echo_only)

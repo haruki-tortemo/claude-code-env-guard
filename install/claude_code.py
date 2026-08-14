@@ -171,16 +171,28 @@ def execution_target(command) -> str:
     return None
 
 
-def handler_is_ours(handler, dest: Path) -> bool:
-    """Does this single handler EXECUTE our installed copy (by resolved path)?
+def target_is_guard(target, dest: Path) -> bool:
+    """The single condition, shared by ownership and health checks and matching
+    the hook's own command_runs_guard: the execution target has our basename
+    AND resolves to the installed copy. The basename half matters so the
+    installer and the hook agree - a differently-named symlink that resolves to
+    our file is a registration the hook does NOT recognize, so the installer
+    must not treat it as one either."""
+    return (target is not None
+            and os.path.basename(target) == HOOK_NAME
+            and _resolve(target) == _resolve(dest))
 
-    A different path with the same basename, or a command that merely mentions
-    our path as an argument, is not ours. Defensive against non-dict handlers.
+
+def handler_is_ours(handler, dest: Path) -> bool:
+    """Does this single handler EXECUTE our installed copy?
+
+    A different path with the same basename, a differently-named symlink, or a
+    command that merely mentions our path as an argument is not ours. Defensive
+    against non-dict handlers.
     """
     if not isinstance(handler, dict):
         return False
-    target = execution_target(handler.get("command"))
-    return target is not None and _resolve(target) == _resolve(dest)
+    return target_is_guard(execution_target(handler.get("command")), dest)
 
 
 def foreign_same_basename_paths(data: dict, dest: Path) -> list:
@@ -251,14 +263,12 @@ def entry_is_healthy(entry: dict, needed: str, dest: Path) -> bool:
         return False
     if not matcher_tokens(entry.get("matcher")) >= matcher_tokens(needed):
         return False
-    dest_real = _resolve(dest)
     for hook in entry.get("hooks", []) or []:
         if not isinstance(hook, dict):
             continue
         if hook.get("type") != "command" or hook.get("async") is True:
             continue
-        target = execution_target(hook.get("command"))
-        if target is not None and _resolve(target) == dest_real:
+        if target_is_guard(execution_target(hook.get("command")), dest):
             return True
     return False
 
