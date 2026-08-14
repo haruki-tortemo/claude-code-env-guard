@@ -593,15 +593,48 @@ def join_line_continuations(command: str) -> str:
     return LINE_CONTINUATION.sub("", command)
 
 
+def line_opens_heredoc(line: str) -> str | None:
+    """Return the heredoc delimiter if this line opens one with an UNQUOTED `<<`.
+
+    A `<<WORD` inside a quoted string is not a redirection; the shell runs the
+    line as an ordinary command. Found in review: matching `<<WORD` anywhere on
+    the line (even inside quotes) let a fabricated marker with a matching
+    terminator swallow a real write between them. So track quote state and only
+    accept an opener whose `<<` is outside quotes.
+    """
+    in_single = in_double = False
+    i, n = 0, len(line)
+    while i < n:
+        c = line[i]
+        if in_single:
+            if c == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if c == '"':
+                in_double = False
+            i += 1
+            continue
+        if c == "'":
+            in_single = True
+        elif c == '"':
+            in_double = True
+        elif c == "<" and i + 1 < n and line[i + 1] == "<":
+            m = HEREDOC_START.match(line, i)
+            if m:
+                return m.group(2)
+        i += 1
+    return None
+
+
 def strip_heredoc_bodies(command: str) -> str:
     """Drop heredoc bodies. A commit message that merely *mentions* settings.json
     must not deny - hit once in real use.
 
-    Found in review: a fabricated `<<WORD` on an earlier line (e.g. inside a
-    quoted string) whose delimiter never appears made this drop the rest of the
-    command, so a real write below it was never judged. Fix: only drop a body
-    that is actually *terminated*; when the delimiter is never found, keep the
-    remaining lines verbatim (fail closed) so the write is still analysed.
+    Only a body opened by a real (unquoted) heredoc and actually *terminated* is
+    dropped. A fabricated or unterminated marker keeps the following lines, so a
+    write hidden below it is still analysed (fail closed).
     """
     lines = command.split("\n")
     kept: list[str] = []
@@ -609,9 +642,8 @@ def strip_heredoc_bodies(command: str) -> str:
     while i < len(lines):
         line = lines[i]
         kept.append(line)
-        m = HEREDOC_START.search(line)
-        if m:
-            delimiter = m.group(2)
+        delimiter = line_opens_heredoc(line)
+        if delimiter is not None:
             j = i + 1
             while j < len(lines) and lines[j].strip() != delimiter:
                 j += 1
@@ -739,12 +771,12 @@ def judge_post_image(path: str, content: str, source: str, fallback_text) -> Non
 def targets_settings_file(path: str) -> bool:
     """Does this Edit/Write file_path resolve to a settings file we watch?
 
-    Found in review (the one finding the security panel verified): matching the
-    raw model-supplied path against a case-sensitive, single-slash regex let
-    equivalent spellings of the same file through -- `.claude//settings.json`,
-    `.claude/./settings.json` (any POSIX host), `.claude/Settings.json` (a
-    case-insensitive macOS/Windows volume), and a symlink to the settings file.
-    Each skipped the whole Edit/Write judgement, defeating the write-time block.
+    Security regression, found in review: matching the raw model-supplied path
+    against a case-sensitive, single-slash regex let equivalent spellings of the
+    same file through -- `.claude//settings.json`, `.claude/./settings.json`
+    (any POSIX host), `.claude/Settings.json` (a case-insensitive macOS/Windows
+    volume), and a symlink to the settings file. Each skipped the whole
+    Edit/Write judgement, defeating the write-time block.
 
     So: normalize the path (fixes the `//` and `/.` spellings on every host),
     and, for the case-variant and symlink cases, fall back to real-inode

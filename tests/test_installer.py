@@ -223,7 +223,6 @@ with tempfile.TemporaryDirectory() as td:
         ("shell-or-true", dict(cmd="python3 {d} || true")),
         ("type-missing", dict(drop_type=True)),
         ("argv-decoy", dict(cmd="python3 -c 'pass' {d}")),
-        ("path-decoy", dict(cmd="python3 /tmp/evil/rc_env_guard.py")),
     )
     for label, mut in forms:
         path = fixture(tmp, None, name="repair-" + label)
@@ -240,6 +239,27 @@ with tempfile.TemporaryDirectory() as td:
         check("repair %s: result passes the hook's registration_problem()" % label,
               mod.registration_problem(after) is None,
               str(mod.registration_problem(after)))
+
+    # A same-basename hook at a DIFFERENT path is not ours: leave it, report it,
+    # and add our own registration alongside (do not delete a third party's hook).
+    decoy = fixture(tmp, None, name="repair-path-decoy")
+    ddec = dest_for(decoy)
+    decoy_cmd = "python3 /tmp/evil/rc_env_guard.py"
+    decoy.write_text(json.dumps(variant_settings(ddec, cmd=decoy_cmd), indent=2),
+                     encoding="utf-8")
+    code, out = run(decoy)
+    dafter = json.loads(decoy.read_text())
+    dcmds = [h.get("command") for e in dafter["hooks"]["PreToolUse"]
+             for h in e.get("hooks", [])]
+    dmod = load_module(ddec, "rc_env_guard_installed_path_decoy")
+    check("path-decoy: our own registration added (not 'repaired' by deleting the decoy)",
+          code == 0 and "added PreToolUse" in out, out[:120])
+    check("path-decoy: the different-path same-basename hook is left untouched",
+          decoy_cmd in dcmds, str(dcmds))
+    check("path-decoy: it is reported, not silently kept",
+          "different path was left untouched" in out, out[:200])
+    check("path-decoy: result still passes registration_problem()",
+          dmod.registration_problem(dafter) is None)
 
     # --- uninstall removes ours (and the copy) and only ours -----------------
     code, out = run(live, "--uninstall")
@@ -300,6 +320,24 @@ with tempfile.TemporaryDirectory() as td:
     check("co-located: the other handler in the same entry survives",
           other_cmd in chandlers, str(chandlers))
 
+    # --- a co-located SAME-BASENAME hook at a DIFFERENT path must survive -----
+    cob = fixture(tmp, None, name="colocated-basename")
+    dcob = dest_for(cob)
+    dcob.parent.mkdir(parents=True, exist_ok=True)
+    dcob.write_bytes(HOOK_SOURCE.read_bytes())
+    vendor_cmd = "python3 /opt/vendor/rc_env_guard.py"   # same basename, different path
+    cob.write_text(json.dumps({"hooks": {"PreToolUse": [
+        {"matcher": "Edit|Write|MultiEdit|Bash", "hooks": [
+            {"type": "command", "command": "python3 %s" % dcob},
+            {"type": "command", "command": vendor_cmd}]}]}}), encoding="utf-8")
+    code, out = run(cob, "--uninstall")
+    cobd = json.loads(cob.read_text())
+    cobh = [h.get("command") for e in cobd["hooks"]["PreToolUse"]
+            for h in e.get("hooks", [])]
+    check("same-basename: our copy removed", "python3 %s" % dcob not in cobh)
+    check("same-basename: the different-path hook with our basename survives",
+          vendor_cmd in cobh, str(cobh))
+
     # --- a malformed (non-dict) handler must not crash with a traceback ------
     nd = fixture(tmp, None, name="nondict")
     nd.write_text('{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [null]}]}}',
@@ -342,6 +380,23 @@ with tempfile.TemporaryDirectory() as td:
           json.loads(b2.read_text()).get("generation") == 1)
     check("backup: created 0600, not the source's mode (no world-readable secret copy)",
           (b1.stat().st_mode & 0o777) == 0o600, oct(b1.stat().st_mode & 0o777))
+
+    # --- a concurrent change since we read the file is detected and aborted --
+    conc = fixture(tmp, {"generation": 0}, name="concurrent")
+    stale_mtime = os.stat(str(conc)).st_mtime_ns
+    # Simulate another writer bumping the file after we captured its mtime.
+    prev = inst.time
+    inst.time = types.SimpleNamespace(strftime=lambda fmt: "20260101T111111")
+    conc.write_text(json.dumps({"generation": 99}) + "\n", encoding="utf-8")
+    aborted = False
+    try:
+        inst.write_atomically(conc, {"generation": 1}, stale_mtime)
+    except inst.Abort:
+        aborted = True
+    inst.time = prev
+    check("concurrent change: write_atomically aborts on a stale mtime", aborted)
+    check("concurrent change: the concurrent writer's content is preserved",
+          json.loads(conc.read_text()).get("generation") == 99)
 
     # --- fault injection: does the suite actually detect a destructive install?
     repo = tmp / "repo"

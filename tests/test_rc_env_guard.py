@@ -61,8 +61,9 @@ EXPECTED_IDS = (
     # Positive: copy/move INTO the .claude directory (destination is a dir, so the
     # created file is dir/basename(src)) - the lexical last-arg check missed these
     "deny-bash-cp-into-dir", "deny-bash-mv-into-dir", "deny-bash-cp-target-dir",
-    # Positive: a fabricated, unterminated heredoc marker must not hide a write
-    "deny-bash-fake-heredoc",
+    # Positive: a fabricated heredoc marker (unterminated, or quoted with a
+    # matching terminator) must not hide a write
+    "deny-bash-fake-heredoc", "deny-bash-fake-heredoc-terminated",
     # Positive: line-continuation shapes that split segments (all four passed
     # live before the fix)
     "deny-bash-linecont-redirect", "deny-bash-linecont-tee",
@@ -91,6 +92,8 @@ EXPECTED_IDS = (
     "allow-bash-cp-backup", "allow-bash-mv-backup", "allow-self-reformat",
     # Negative: copying settings OUT into another directory is a backup, not a write
     "allow-bash-cp-into-tmp-dir",
+    # Negative: a real heredoc body containing a cp-into-settings string is data
+    "allow-bash-real-heredoc-cp",
     # Negative: READS containing line continuations (the same hole's flip
     # side - plain reads were being blocked)
     "allow-bash-linecont-read", "allow-bash-linecont-loop",
@@ -254,7 +257,8 @@ def main() -> int:  # noqa: C901
                "new_string": '"A": "1",\n    "DO_NOT_TRACK": "1"'}]}})
     case("deny-write-unmeasured-value", 'Write: unmeasured value "false" fails closed', DENY,
          write(user_clean, {"env": {"DO_NOT_TRACK": "false"}}))
-    # Equivalent path spellings that resolve to the same settings file (F1).
+    # Equivalent path spellings that resolve to the same settings file
+    # (the security regression fixed by targets_settings_file).
     case("deny-edit-double-slash", "Edit: `.claude//settings.json` (extra slash)", DENY,
          edit(user_clean.replace("/.claude/", "/.claude//"),
               '"OTHER_TOOL_NO_TELEMETRY": "1"',
@@ -300,6 +304,11 @@ def main() -> int:  # noqa: C901
     # A fabricated, never-closed heredoc marker must not delete the write below it.
     case("deny-bash-fake-heredoc", "fake `<< X` on line 1 hides a write on line 2", DENY,
          bash('echo "note: a << ZZ"\ncp /tmp/rc-stage.json ~/.claude/settings.json'))
+    # A QUOTED `<<ZZ` with a matching terminator is not a real heredoc; the write
+    # between them still runs, so it must still be judged.
+    case("deny-bash-fake-heredoc-terminated",
+         "quoted `<<ZZ` + real write + matching `ZZ` line", DENY,
+         bash('echo "note <<ZZ"\ncp /tmp/rc-stage.json ~/.claude/settings.json\nZZ'))
     # Wrapper options used to be misread as the command head ("-i" etc.).
     case("deny-bash-env-i-cp", "env -i cp (through a wrapper option)", DENY,
          bash("env -i cp /tmp/rc-stage.json ~/.claude/settings.json"))
@@ -440,6 +449,8 @@ def main() -> int:  # noqa: C901
          bash("mv ~/.claude/settings.json /tmp/settings-backup.json"))
     case("allow-bash-cp-into-tmp-dir", "Bash: cp settings -> /tmp/ (backup into a dir)", ALLOW,
          bash("cp ~/.claude/settings.json /tmp/"))
+    case("allow-bash-real-heredoc-cp", "Bash: real heredoc body contains a cp string (data)", ALLOW,
+         bash("cat <<'EOF' > /tmp/notes.txt\ncp /tmp/x ~/.claude/settings.json\nEOF"))
     case("allow-self-reformat", "Write: reformat, registrations kept", ALLOW,
          write(guarded, guarded_body))
     # Metadata-only operations used to be denied with a reason text ("use

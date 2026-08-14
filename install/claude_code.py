@@ -43,6 +43,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import sys
 import tempfile
 import time
@@ -142,32 +143,69 @@ def command_argv(command):
         return None
 
 
-def handler_is_ours(handler) -> bool:
-    """Does this single handler invoke our script (by basename)?
+def handler_is_ours(handler, dest: Path) -> bool:
+    """Does this single handler invoke OUR installed copy (by resolved path)?
 
-    Loose on purpose so uninstall/repair catch stale entries (old paths, a
-    different interpreter) - but defensive against non-dict handlers, which a
-    hand-edited or third-party settings file may contain.
+    Resolved-path, not basename. Found in review: matching the basename
+    `rc_env_guard.py` anywhere in the command also deleted a same-named
+    third-party hook at a different path (`/opt/vendor/rc_env_guard.py`). A
+    command token must resolve to the stable dest for the handler to be ours;
+    a different path with the same basename is left alone. Defensive against
+    non-dict handlers, which a hand-edited settings file may contain.
     """
     if not isinstance(handler, dict):
         return False
     command = handler.get("command")
     if not isinstance(command, str):
         return False
+    dest_real = _resolve(dest)
     argv = command_argv(command)
     tokens = argv if argv is not None else command.split()
-    return any(os.path.basename(t) == HOOK_NAME for t in tokens)
+    return any(_resolve(t) == dest_real for t in tokens)
 
 
-def entry_is_ours(entry: dict) -> bool:
-    """Does any handler in this entry reference our script?"""
+def _resolve(token) -> str:
+    try:
+        return os.path.realpath(os.path.expanduser(str(token)))
+    except OSError:
+        return ""
+
+
+def foreign_same_basename_paths(data: dict, dest: Path) -> list:
+    """Registrations that name our script's basename but resolve elsewhere.
+
+    We do NOT touch these (they may be a legitimate third-party hook, or a
+    decoy). We report them so the operator can decide - the tool's whole point
+    is to not be silent.
+    """
+    dest_real = _resolve(dest)
+    found = []
+    hooks = (data or {}).get("hooks")
+    if not isinstance(hooks, dict):
+        return found
+    for entries in hooks.values():
+        for e in entries if isinstance(entries, list) else []:
+            handlers = e.get("hooks") if isinstance(e, dict) else None
+            for h in handlers if isinstance(handlers, list) else []:
+                command = h.get("command") if isinstance(h, dict) else None
+                if not isinstance(command, str):
+                    continue
+                argv = command_argv(command)
+                for t in (argv if argv is not None else command.split()):
+                    if os.path.basename(t) == HOOK_NAME and _resolve(t) != dest_real:
+                        found.append(t)
+    return sorted(set(found))
+
+
+def entry_is_ours(entry: dict, dest: Path) -> bool:
+    """Does any handler in this entry reference our installed copy?"""
     if not isinstance(entry, dict):
         return False
     handlers = entry.get("hooks")
-    return isinstance(handlers, list) and any(handler_is_ours(h) for h in handlers)
+    return isinstance(handlers, list) and any(handler_is_ours(h, dest) for h in handlers)
 
 
-def strip_our_handlers(entries: list):
+def strip_our_handlers(entries: list, dest: Path):
     """Return (new_entries, removed_count), removing only OUR handlers.
 
     Handler granularity, not entry granularity: a settings entry that groups our
@@ -179,8 +217,8 @@ def strip_our_handlers(entries: list):
     removed = 0
     for e in entries:
         handlers = e.get("hooks") if isinstance(e, dict) else None
-        if isinstance(handlers, list) and any(handler_is_ours(h) for h in handlers):
-            kept = [h for h in handlers if not handler_is_ours(h)]
+        if isinstance(handlers, list) and any(handler_is_ours(h, dest) for h in handlers):
+            kept = [h for h in handlers if not handler_is_ours(h, dest)]
             removed += len(handlers) - len(kept)
             if kept:                       # other handlers remain -> keep the entry
                 new_entries.append({**e, "hooks": kept})
@@ -239,7 +277,7 @@ def install(data: dict, dest: Path) -> list:
             continue
         # Not healthy: strip only our (stale) handlers, keep co-located ones,
         # then append a correct fresh registration.
-        new_entries, removed = strip_our_handlers(entries)
+        new_entries, removed = strip_our_handlers(entries, dest)
         handler = {"type": "command", "command": guard_command(dest), "timeout": timeout}
         if status:
             handler["statusMessage"] = status
@@ -250,7 +288,7 @@ def install(data: dict, dest: Path) -> list:
     return changes
 
 
-def uninstall(data: dict) -> list:
+def uninstall(data: dict, dest: Path) -> list:
     changes = []
     hooks = data.get("hooks")
     if not isinstance(hooks, dict):
@@ -259,7 +297,7 @@ def uninstall(data: dict) -> list:
         entries = hooks.get(event)
         if not isinstance(entries, list):
             continue
-        new_entries, removed = strip_our_handlers(entries)
+        new_entries, removed = strip_our_handlers(entries, dest)
         if removed:
             changes.append("removed %d handler%s from %s"
                            % (removed, "" if removed == 1 else "s", event))
@@ -322,20 +360,47 @@ def write_atomically(path: Path, data: dict, known_mtime_ns: int = None) -> Path
     # Operate on the real file so a symlinked settings.json is updated in place,
     # not converted to a regular file that detaches the user's dotfiles copy.
     real = Path(os.path.realpath(str(path)))
-    orig_mode = os.stat(real).st_mode & 0o777
 
-    # Backup: write through the exclusively-created fd, kept at 0600. Never
-    # reopen by name (no symlink race), never copystat (no world-readable copy
-    # of a file that may hold API keys).
-    backup_fd, backup = unique_backup_open(real)
-    with os.fdopen(backup_fd, "wb") as bf, open(real, "rb") as src:
-        shutil.copyfileobj(src, bf)
-        bf.flush()
-        os.fsync(bf.fileno())
+    # Open the source ONCE with O_NOFOLLOW and read the backup from that fd, so
+    # the "resolve path, then read it by name" window cannot be raced (swapping
+    # `real` for a symlink between the two). Identity/mode come from fstat on the
+    # very fd we copy from.
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    try:
+        src_fd = os.open(str(real), os.O_RDONLY | nofollow)
+    except OSError as exc:
+        raise Abort("Cannot open %s safely (%s). Nothing was changed." % (real, exc))
+    try:
+        src_stat = os.fstat(src_fd)
+        orig_mode = src_stat.st_mode & 0o777
+        # Backup: write through the exclusively-created fd, kept at 0600. Never
+        # reopen by name, never copystat (no world-readable copy of a file that
+        # may hold API keys).
+        backup_fd, backup = unique_backup_open(real)
+        with os.fdopen(backup_fd, "wb") as bf, os.fdopen(os.dup(src_fd), "rb") as src:
+            shutil.copyfileobj(src, bf)
+            bf.flush()
+            os.fsync(bf.fileno())
+    finally:
+        os.close(src_fd)
 
-    # A concurrent writer (Claude Code itself, or a second installer) must not
-    # be silently overwritten. If the file changed since we read it, abort.
-    if known_mtime_ns is not None and os.stat(real).st_mtime_ns != known_mtime_ns:
+    def _changed_under_us() -> bool:
+        # Best-effort detection: a concurrent writer (Claude Code, a second
+        # installer) or a symlink swap since we read the file. Non-cooperating
+        # processes cannot be fully excluded without a shared lock.
+        try:
+            st = os.lstat(real)
+        except OSError:
+            return True
+        if stat.S_ISLNK(st.st_mode):
+            return True
+        if (st.st_ino, st.st_dev) != (src_stat.st_ino, src_stat.st_dev):
+            return True
+        if known_mtime_ns is not None and st.st_mtime_ns != known_mtime_ns:
+            return True
+        return st.st_mtime_ns != src_stat.st_mtime_ns
+
+    if _changed_under_us():
         raise Abort(
             "%s changed on disk while the installer was running.\n"
             "Nothing was written (a backup was taken at %s). Re-run to retry."
@@ -349,6 +414,14 @@ def write_atomically(path: Path, data: dict, known_mtime_ns: int = None) -> Path
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp, orig_mode)        # keep the user's mode, don't silently change it
+        # Re-check right before the swap: closes the window between the check
+        # above and the replace.
+        if _changed_under_us():
+            os.unlink(tmp)
+            raise Abort(
+                "%s changed on disk just before the write.\n"
+                "Nothing was written (a backup was taken at %s). Re-run to retry."
+                % (real, backup))
         os.replace(tmp, real)           # atomic on POSIX
     except BaseException:
         if os.path.exists(tmp):
@@ -388,7 +461,7 @@ def main() -> int:
         data = load_settings(args.settings)
         mtime_ns = os.stat(os.path.realpath(str(args.settings))).st_mtime_ns
         if args.uninstall:
-            changes = uninstall(data)
+            changes = uninstall(data, dest)
             # Only remove the hook file if we actually removed registrations for
             # it -- otherwise a run against an unrelated checkout would delete a
             # file that other, still-present registrations point at.
@@ -410,6 +483,11 @@ def main() -> int:
         print("Could not process %s (%s: %s). Nothing was changed."
               % (args.settings, type(exc).__name__, exc), file=sys.stderr)
         return 1
+
+    for foreign in foreign_same_basename_paths(data, dest):
+        print("Note: a hook referencing %s at a different path was left untouched: %s\n"
+              "      (it is not our installed copy -- remove it by hand if unexpected)."
+              % (HOOK_NAME, foreign), file=sys.stderr)
 
     verb = "uninstall" if args.uninstall else "install"
     if not changes:

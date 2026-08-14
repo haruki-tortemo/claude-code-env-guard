@@ -15,7 +15,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.9", "3.13"]
+        # 3.9 is the interpreter floor; 3.14 is the current feature series.
+        python-version: ["3.9", "3.13", "3.14"]
     steps:
       # Actions pinned to commit SHAs (not mutable tags) so a moved upstream tag
       # cannot change what runs here.

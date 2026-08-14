@@ -81,11 +81,12 @@ They exist because a hook is a single Python process reacting to one tool call a
 cannot be a security boundary against an actor (including a prompt-injected model) that is
 actively working around it. If your threat model includes that, this hook is not your control.
 
-- **Equivalent spellings of the settings path.** The write-time check normalizes the path and
-  falls back to real-inode identity, so `~/.claude//settings.json`, `~/.claude/./settings.json`,
-  and a symlink to the settings file are caught, as is a case variant like `~/.claude/Settings.json`
-  **when the file already exists** on a case-insensitive volume. Still out of scope: a case variant
-  of a settings file that does not exist yet, and native Windows `\` paths.
+- **Equivalent spellings of the settings path.** For **Edit/Write/MultiEdit** `file_path` values,
+  the guard normalizes `//` and `/.` and checks existing files by inode identity, so symlink
+  aliases and existing case variants on a case-insensitive volume are caught. **Bash inspection is
+  lexical**: a symlink alias, a case variant, native Windows `\` paths, and command forms outside
+  the documented enumeration are *not* covered on the Bash path. A case variant of a settings file
+  that does not exist yet is also out of scope.
 - **Environment-based interpreter tricks.** A settings write that sets `PATH` or `PYTHONPATH`
   (neither is on the blocked list) can stop the hook from running, or make it import attacker
   Python — without touching the `hooks` block.
@@ -93,8 +94,9 @@ actively working around it. If your threat model includes that, this hook is not
   overwriting or deleting it disarms the guard while `settings.json` still shows it registered.
 - **Deleting or moving settings.json via Bash** (`rm`, `mv` to elsewhere) removes the
   registration; only writes *into* the file are judged.
-- **Registration forms the recognizer doesn't know** (a version-suffixed interpreter it hasn't
-  been taught, a matcher spelled with commas or spaces) leave the self-registration invariant off.
+- **Registration forms the recognizer doesn't know** — for example an interpreter whose basename
+  is not in the recognizer's list (a version-suffixed `python3.14`, or `/usr/bin/env python3`) —
+  leave the self-registration invariant off.
 - **Crafted, very long commands** can make the Bash regexes slow enough to hit the hook timeout.
 
 The value it does provide is against the *accident*: a telemetry opt-out pasted into settings by a
@@ -179,16 +181,16 @@ path — settings, shell profile, `--settings`, managed policy — is caught eve
 ## Tests
 
 ```bash
-python3 tests/test_rc_env_guard.py   # 98 cases: the guard's decision contract
-python3 tests/test_compat.py         #  9 cases: the interpreter-floor contract
-python3 tests/test_installer.py      # 63 cases: the installer, incl. spaces/metachars
-                                     #           in the path, repair, backups,
-                                     #           co-located hooks, move-then-uninstall
+python3 tests/test_rc_env_guard.py   # 100 cases: the guard's decision contract
+python3 tests/test_compat.py         #   9 cases: the interpreter-floor contract
+python3 tests/test_installer.py      #  69 cases: the installer, incl. spaces/metachars
+                                     #            in the path, repair, backups,
+                                     #            co-located hooks, move-then-uninstall
 ```
 
 The main suite checks its own coverage against an expected-ID manifest, so deleting a case
 fails the run rather than quietly shrinking the denominator. CI runs all three suites on
-Python 3.9 and a current Python.
+Python 3.9 (the interpreter floor), 3.13, and 3.14 (the current series).
 
 The suites also **inject faults**: they disable parts of the hook or installer and assert the
 run goes red. A test that stays green when you break the thing it tests is not a test.
