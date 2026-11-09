@@ -28,6 +28,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -51,10 +52,13 @@ EXISTING = {
 }
 
 
-def run(settings: pathlib.Path, *extra: str, installer: pathlib.Path = INSTALLER):
+def run(settings: pathlib.Path, *extra: str, installer: pathlib.Path = INSTALLER,
+        home: pathlib.Path = None):
+    """`home` sets HOME for the installer, so ~/.claude is a temp dir."""
+    env = None if home is None else {**os.environ, "HOME": str(home)}
     proc = subprocess.run(
         [sys.executable, str(installer), "--settings", str(settings), *extra],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     return proc.returncode, proc.stdout + proc.stderr
 
@@ -422,7 +426,9 @@ with tempfile.TemporaryDirectory() as td:
                             for ev in ("PreToolUse", "SessionStart", "ConfigChange")),
           out[:120])
 
-    # --- a symlinked settings.json is updated in place, not replaced ---------
+    # --- a symlinked ~/.claude/settings.json (dotfiles) is updated in place,
+    #     not replaced. HOME is a temp dir, so this is the user's own ~/.claude;
+    #     the same link in a project's .claude/ is refused (CWE-59, below). ----
     realdir = tmp / "realsettings" / ".claude"
     realdir.mkdir(parents=True)
     realfile = realdir / "settings.json"
@@ -431,13 +437,495 @@ with tempfile.TemporaryDirectory() as td:
     linkdir.mkdir(parents=True)
     linkpath = linkdir / "settings.json"
     os.symlink(realfile, linkpath)
-    code, out = run(linkpath)
+    code, out = run(linkpath, home=tmp / "linked")
     check("symlink settings: install exit 0", code == 0, out[:80])
     check("symlink settings: path is still a symlink (not replaced by a file)",
           os.path.islink(linkpath))
     check("symlink settings: the real target received the registrations",
           all(ev in json.loads(realfile.read_text()).get("hooks", {})
               for ev in ("PreToolUse", "SessionStart", "ConfigChange")))
+
+    # --- CWE-59: a project's .claude/ is repository content, and git checks
+    #     committed symlinks out as symlinks. No link the repository may have
+    #     committed (one inside a git work tree) may move a write or a delete
+    #     out of the directory the user named - least of all into ~/.claude.
+    #     A "clone" here is a directory with a `.git` entry. HOME is a temp dir
+    #     throughout, so the real ~/.claude is never involved. ---------------
+    home = tmp / "home"
+    user_dir = home / ".claude"
+    user_hooks = user_dir / "hooks"
+    user_hooks.mkdir(parents=True)
+    user_settings = user_dir / "settings.json"
+    user_settings.write_text(json.dumps(EXISTING), encoding="utf-8")
+    victim = home / "victim.txt"
+    victim.write_text("KEEP\n", encoding="utf-8")
+
+    def user_side_untouched() -> bool:
+        return (json.loads(user_settings.read_text()) == EXISTING
+                and not backups(user_settings)
+                and not (user_hooks / "rc_env_guard.py").exists()
+                and victim.read_text() == "KEEP\n")
+
+    def clone_dir(name: str) -> pathlib.Path:
+        d = tmp / name
+        (d / ".git").mkdir(parents=True)
+        return d
+
+    def repo_fixture(content, name: str) -> pathlib.Path:
+        clone_dir(name)
+        return fixture(tmp, content, name=name)
+
+    # Route 1: the hook file is a symlink out of the project.
+    p = repo_fixture({}, "cwe59-hook-file")
+    dest_for(p).parent.mkdir()
+    os.symlink(str(victim), str(dest_for(p)))
+    code, out = run(p, "--dry-run", home=home)
+    check("project hook-file symlink out: dry-run refuses",
+          code == 1 and "Refusing" in out, out[:200])
+    code, out = run(p, home=home)
+    check("project hook-file symlink out: refused, link target and settings untouched",
+          code == 1 and "Refusing" in out and user_side_untouched()
+          and p.read_text() == "{}" and not backups(p) and os.path.islink(dest_for(p)),
+          out[:200])
+    p = repo_fixture({}, "cwe59-hook-dangling")
+    dest_for(p).parent.mkdir()
+    os.symlink(str(home / "created.py"), str(dest_for(p)))
+    code, out = run(p, home=home)
+    check("project dangling hook-file symlink out: refused, nothing created",
+          code == 1 and not (home / "created.py").exists(), out[:200])
+
+    # Route 2: hooks/ is a symlink to ~/.claude/hooks.
+    p = repo_fixture({}, "cwe59-hooks-dir")
+    os.symlink(str(user_hooks), str(p.parent / "hooks"))
+    code, out = run(p, home=home)
+    check("project hooks/ symlink to ~/.claude/hooks: refused, nothing written there",
+          code == 1 and "Refusing" in out and user_side_untouched()
+          and p.read_text() == "{}", out[:200])
+
+    # Route 3: .claude itself is a symlink to ~/.claude.
+    linked_claude = clone_dir("cwe59-claude-dir") / ".claude"
+    os.symlink(str(user_dir), str(linked_claude))
+    code, out = run(linked_claude / "settings.json", home=home)
+    check("project .claude symlink to ~/.claude: refused, user settings untouched",
+          code == 1 and "Refusing" in out and user_side_untouched(), out[:200])
+
+    # Route 4: settings.json is a symlink to ~/.claude/settings.json, absolute or
+    # relative (the relative form only needs the clone depth).
+    for label, target in (("absolute", str(user_settings)),
+                          ("relative", os.path.join("..", "..", "home", ".claude",
+                                                    "settings.json"))):
+        p = repo_fixture(None, "cwe59-settings-" + label)
+        os.symlink(target, str(p))
+        code, out = run(p, home=home)
+        check("project settings.json symlink (%s) to ~/.claude/settings.json: "
+              "refused, no registration in user settings" % label,
+              os.path.realpath(str(p)) == os.path.realpath(str(user_settings))
+              and code == 1 and "Refusing" in out and user_side_untouched()
+              and not dest_for(p).exists(), out[:200])
+
+    # Route 5: a directory above .claude, inside the repository, is a symlink -
+    # to the home directory (the run must not count as the user's own
+    # ~/.claude install), to another project, or reached by `..`.
+    anc = clone_dir("cwe59-ancestor")
+    os.symlink(str(home), str(anc / "pkg"))
+    code, out = run(anc / "pkg" / ".claude" / "settings.json", home=home)
+    check("repository ancestor symlink resolving to ~: refused, not treated as ~/.claude",
+          code == 1 and "Refusing" in out and user_side_untouched(), out[:200])
+    other = fixture(tmp, {}, name="cwe59-other-project")
+    os.symlink(str(other.parent.parent), str(anc / "pkg2"))
+    code, out = run(anc / "pkg2" / ".claude" / "settings.json", home=home)
+    check("repository ancestor symlink to another project: refused, resolved path named",
+          code == 1 and os.path.realpath(str(other)) in out and other.read_text() == "{}"
+          and not backups(other) and not dest_for(other).exists(), out[:300])
+    code, out = run(pathlib.Path(os.path.realpath(str(other))), home=home)
+    check("the resolved path named directly: installs",
+          code == 0 and dest_for(other).exists(), out[:200])
+    (home / "sub").mkdir()
+    os.symlink(str(home / "sub"), str(anc / "sub"))
+    code, out = run(anc / "sub" / ".." / ".claude" / "settings.json", home=home)
+    check("`..` after a repository symlink (lands in ~/.claude): refused",
+          code == 1 and "Refusing" in out and user_side_untouched(), out[:200])
+    # The same ancestor link entered with `cd`, then a relative --settings: the
+    # physical cwd has no link in it, so the installer must check the shell's
+    # $PWD. Without that the run counts as the user's own ~/.claude install.
+    logical = anc / "pkg"
+    proc = subprocess.run(
+        [sys.executable, str(INSTALLER), "--settings", ".claude/settings.json"],
+        capture_output=True, text=True, cwd=str(logical),
+        env={**os.environ, "HOME": str(home), "PWD": str(logical)})
+    out = proc.stdout + proc.stderr
+    check("`cd` through a repository symlink, relative --settings: refused",
+          proc.returncode == 1 and "Refusing" in out and user_side_untouched(), out[:300])
+    # A relative --settings is registered as an absolute command: a relative
+    # `python3 .claude/hooks/rc_env_guard.py` would run each project's own file.
+    rel = fixture(tmp, {}, name="cwe59-relative")
+    proc = subprocess.run(
+        [sys.executable, str(INSTALLER), "--settings", ".claude/settings.json"],
+        capture_output=True, text=True, cwd=str(rel.parent.parent),
+        env={**os.environ, "HOME": str(home), "PWD": str(rel.parent.parent)})
+    cmds = registered_commands(json.loads(rel.read_text())) if proc.returncode == 0 else []
+    check("relative --settings: installs with an absolute registered command",
+          proc.returncode == 0 and cmds
+          and all(os.path.isabs(shlex.split(c)[-1]) for c in cmds),
+          (proc.stdout + proc.stderr)[:200] + " " + repr(cmds))
+    other_clone = repo_fixture({}, "cwe59-other-clone")
+    os.symlink(str(other_clone.parent.parent), str(anc / "pkg3"))
+    code, out = run(anc / "pkg3" / ".claude" / "settings.json", home=home)
+    check("repository ancestor symlink to another clone: refused, that clone untouched",
+          code == 1 and "git work tree" in out and other_clone.read_text() == "{}"
+          and not backups(other_clone) and not dest_for(other_clone).exists(), out[:300])
+    # ~/.claude reached through a link outside any work tree (an unpacked
+    # archive, say) does not count as naming ~/.claude, even when ~/.claude's
+    # real directory is a dotfiles repo: only the filesystem root's links do.
+    home5 = tmp / "home5"
+    home5.mkdir()
+    dot5 = clone_dir("dotfiles5") / "claude"
+    dot5.mkdir()
+    (dot5 / "settings.json").write_text("{}", encoding="utf-8")
+    os.symlink(str(dot5), str(home5 / ".claude"))
+    (tmp / "unpacked").mkdir()
+    os.symlink(str(home5), str(tmp / "unpacked" / "pkg"))
+    code, out = run(tmp / "unpacked" / "pkg" / ".claude" / "settings.json", home=home5)
+    check("~/.claude reached through a link outside any work tree: refused, untouched",
+          code == 1 and "Refusing" in out and (dot5 / "settings.json").read_text() == "{}"
+          and not (dot5 / "hooks").exists(), out[:300])
+
+    # Uninstall: its delete and its settings write must not follow those links
+    # either. The user has a global install; a project points at it.
+    code, out = run(user_settings, home=home)
+    check("~/.claude install (HOME in a temp dir): exit 0",
+          code == 0 and (user_hooks / "rc_env_guard.py").exists(), out[:200])
+    snapshot = user_settings.read_bytes()
+    global_cmd = guard_commands(json.loads(snapshot))[0]
+    p = repo_fixture({"hooks": {"PreToolUse": [
+        {"matcher": "Edit|Write|MultiEdit|Bash",
+         "hooks": [{"type": "command", "command": global_cmd}]}]}},
+        "cwe59-uninstall-hooks-dir")
+    os.symlink(str(user_hooks), str(p.parent / "hooks"))
+    code, out = run(p, "--uninstall", home=home)
+    check("project hooks/ symlink to ~/.claude/hooks: uninstall refused, global copy kept",
+          code == 1 and "Refusing" in out and (user_hooks / "rc_env_guard.py").exists()
+          and user_settings.read_bytes() == snapshot, out[:200])
+    linked_claude = clone_dir("cwe59-uninstall-claude-dir") / ".claude"
+    os.symlink(str(user_dir), str(linked_claude))
+    code, out = run(linked_claude / "settings.json", "--uninstall", home=home)
+    check("project .claude symlink to ~/.claude: uninstall refused, global install kept",
+          code == 1 and "Refusing" in out and (user_hooks / "rc_env_guard.py").exists()
+          and user_settings.read_bytes() == snapshot, out[:200])
+    # The delete removes the directory entry, not the file it resolves to: a
+    # hooks/ link out whose entry links back inside must not get it removed.
+    p = repo_fixture(None, "cwe59-uninstall-entry")
+    back = p.parent / "vendored" / "rc_env_guard.py"
+    back.parent.mkdir()
+    back.write_bytes(HOOK_SOURCE.read_bytes())
+    outside_hooks = tmp / "cwe59-outside-hooks"
+    outside_hooks.mkdir()
+    os.symlink(str(back), str(outside_hooks / "rc_env_guard.py"))
+    os.symlink(str(outside_hooks), str(p.parent / "hooks"))
+    p.write_text(json.dumps(variant_settings(dest_for(p))), encoding="utf-8")
+    code, out = run(p, "--uninstall", home=home)
+    check("project hooks/ symlink out, entry linking back in: uninstall refused, "
+          "the outside entry kept",
+          code == 1 and "Refusing" in out
+          and os.path.islink(outside_hooks / "rc_env_guard.py"), out[:200])
+
+    # Maintainer policy: a project's hook file is never written through a
+    # symlink, even one that stays inside the settings directory - a committed
+    # `hooks/rc_env_guard.py -> ../settings.local.json` would otherwise have the
+    # hook copy overwrite the user's local settings. Install, dry-run and
+    # uninstall all refuse, and neither the link nor its target changes.
+    p = repo_fixture({}, "cwe59-hook-to-local")
+    local = p.parent / "settings.local.json"
+    local_bytes = json.dumps({"permissions": {"allow": ["Bash(ls)"]}}).encode()
+    local.write_bytes(local_bytes)
+    dest_for(p).parent.mkdir()
+    os.symlink(os.path.join("..", "settings.local.json"), str(dest_for(p)))
+    results_hook_link = [run(p, *extra, home=home) for extra in
+                         ((), ("--dry-run",), ("--uninstall",))]
+    check("project hook-file symlink to ../settings.local.json: install, dry-run and "
+          "uninstall refused, local settings and the link untouched",
+          all(c == 1 and "Refusing to write the hook through it" in o
+              for c, o in results_hook_link)
+          and local.read_bytes() == local_bytes and not backups(local)
+          and os.path.islink(dest_for(p)) and p.read_text() == "{}" and not backups(p),
+          str([o[:160] for _, o in results_hook_link]))
+    # A link appearing at the hook file after that check (a race) is not
+    # written through either: in a project, copy_hook replaces the entry.
+    inst_race = load_module(INSTALLER, "installer_hook_race")
+    p = repo_fixture({}, "cwe59-hook-race")
+    local = p.parent / "settings.local.json"
+    local.write_bytes(local_bytes)
+    dest_for(p).parent.mkdir()
+    os.symlink(os.path.join("..", "settings.local.json"), str(dest_for(p)))
+    inst_race.copy_hook(dest_for(p), os.path.realpath(str(p.parent)))
+    check("copy_hook in a project: a link at the hook file is replaced, not written through",
+          local.read_bytes() == local_bytes and not os.path.islink(dest_for(p))
+          and dest_for(p).read_bytes() == HOOK_SOURCE.read_bytes())
+    p = repo_fixture({}, "cwe59-inner-hook")
+    vendored = p.parent / "vendored" / "rc_env_guard.py"
+    vendored.parent.mkdir()
+    vendored.write_text("old\n", encoding="utf-8")
+    dest_for(p).parent.mkdir()
+    os.symlink(os.path.join("..", "vendored", "rc_env_guard.py"), str(dest_for(p)))
+    code, out = run(p, home=home)
+    check("project hook symlink inside .claude: refused, its target untouched",
+          code == 1 and "Refusing to write the hook through it" in out
+          and os.path.islink(dest_for(p)) and vendored.read_text() == "old\n"
+          and p.read_text() == "{}", out[:200])
+    # Kept: a settings-file or hooks/ link that stays inside a project's
+    # settings directory is followed.
+    p = repo_fixture({}, "cwe59-inner-hooks-dir")
+    (p.parent / "vendor-hooks").mkdir()
+    os.symlink("vendor-hooks", str(p.parent / "hooks"))
+    code, out = run(p, home=home)
+    check("project hooks/ symlink inside .claude: followed, hook written in its target",
+          code == 0 and os.path.islink(p.parent / "hooks")
+          and (p.parent / "vendor-hooks" / "rc_env_guard.py").read_bytes()
+          == HOOK_SOURCE.read_bytes(), out[:200])
+    p = repo_fixture(None, "cwe59-inner-settings")
+    shared = p.parent / "shared.json"
+    shared.write_text("{}", encoding="utf-8")
+    os.symlink("shared.json", str(p))
+    code, out = run(p, home=home)
+    check("project settings.json symlink inside .claude: followed, updated in place",
+          code == 0 and os.path.islink(p)
+          and "PreToolUse" in json.loads(shared.read_text()).get("hooks", {}), out[:200])
+
+    # Kept: in the user's own ~/.claude every link is followed (dotfiles) - a
+    # hook-file link out of it, and ~/.claude itself as a directory link.
+    home2 = tmp / "home2"
+    dotfile = tmp / "dotfiles2" / "rc_env_guard.py"
+    dotfile.parent.mkdir()
+    dotfile.write_text("old\n", encoding="utf-8")
+    h2 = fixture(tmp, {}, name="home2")
+    dest_for(h2).parent.mkdir()
+    os.symlink(str(dotfile), str(dest_for(h2)))
+    code, out = run(h2, home=home2)
+    check("~/.claude hook symlink to dotfiles: followed, updated in place",
+          code == 0 and os.path.islink(dest_for(h2))
+          and dotfile.read_bytes() == HOOK_SOURCE.read_bytes(), out[:200])
+    home3 = tmp / "home3"
+    home3.mkdir()
+    dotdir = tmp / "dotfiles3" / "claude"
+    dotdir.mkdir(parents=True)
+    (dotdir / "settings.json").write_text("{}", encoding="utf-8")
+    os.symlink(str(dotdir), str(home3 / ".claude"))
+    code, out = run(home3 / ".claude" / "settings.json", home=home3)
+    check("~/.claude as a dotfiles dir symlink: installed in the real dir",
+          code == 0 and os.path.islink(home3 / ".claude")
+          and (dotdir / "hooks" / "rc_env_guard.py").read_bytes() == HOOK_SOURCE.read_bytes()
+          and "PreToolUse" in json.loads((dotdir / "settings.json").read_text())["hooks"],
+          out[:200])
+
+    # Maintainer policy (fail safe): a link outside any git work tree cannot be
+    # told apart from one unpacked from an archive, so a project install refuses
+    # it too - even the user's own link above a clone ($T/code -> $T/realcode).
+    # The refusal names the resolved path, and passing that path installs.
+    realcode = tmp / "realcode"
+    clone_dir("realcode/proj")
+    up = fixture(realcode, EXISTING, name="proj")
+    os.symlink(str(realcode), str(tmp / "code"))
+    named = tmp / "code" / "proj" / ".claude" / "settings.json"
+    code, out = run(named, home=home)
+    check("user's symlink above a clone: refused, resolved path named, clone untouched",
+          code == 1 and "outside any git work tree" in out
+          and os.path.realpath(str(up)) in out
+          and json.loads(up.read_text()) == EXISTING and not backups(up)
+          and not dest_for(up).exists(), out[:300])
+    code, out = run(pathlib.Path(os.path.realpath(str(up))), home=home)
+    updata = json.loads(up.read_text())
+    check("user's symlink above a clone: the resolved path named instead installs",
+          code == 0 and all(ev in updata["hooks"]
+                            for ev in ("PreToolUse", "SessionStart", "ConfigChange"))
+          and dest_for(up).read_bytes() == HOOK_SOURCE.read_bytes()
+          and user_settings.read_bytes() == snapshot, out[:200])
+    check("user's symlink above a clone: registered command launches",
+          bool(guard_commands(updata)) and launch(guard_commands(updata)[0]) == 1)
+    # Without a work tree around the target the same link is refused alike.
+    nogit = fixture(tmp / "realcode-nogit", {}, name="proj")
+    os.symlink(str(tmp / "realcode-nogit"), str(tmp / "code-nogit"))
+    code, out = run(tmp / "code-nogit" / "proj" / ".claude" / "settings.json", home=home)
+    check("user's symlink above a directory with no work tree: refused, resolved path named",
+          code == 1 and "outside any git work tree" in out
+          and os.path.realpath(str(nogit)) in out
+          and nogit.read_text() == "{}" and not dest_for(nogit).exists(), out[:300])
+    # Review route: an unpacked archive (no work tree) whose .claude links into
+    # a sibling clone used to be followed because the TARGET lay in a work
+    # tree, retargeting the install into that other project. Refused now, in
+    # --dry-run and --uninstall too.
+    sibling = repo_fixture(EXISTING, "cwe59-sibling-clone")
+    archive = tmp / "cwe59-archive"
+    archive.mkdir()
+    os.symlink(os.path.join("..", "cwe59-sibling-clone", ".claude"), str(archive / ".claude"))
+    archive_runs = [run(archive / ".claude" / "settings.json", *extra, home=home)
+                    for extra in ((), ("--dry-run",), ("--uninstall",))]
+    check("archive .claude -> ../<sibling clone>/.claude: refused, sibling untouched",
+          all(c == 1 and "outside any git work tree" in o
+              and os.path.realpath(str(sibling)) in o for c, o in archive_runs)
+          and json.loads(sibling.read_text()) == EXISTING and not backups(sibling)
+          and not dest_for(sibling).exists(), str([o[:200] for _, o in archive_runs]))
+    os.symlink(os.path.join("..", "cwe59-sibling-clone"), str(archive / "pkg"))
+    code, out = run(archive / "pkg" / ".claude" / "settings.json", home=home)
+    check("archive pkg -> ../<sibling clone>: refused, sibling untouched",
+          code == 1 and "outside any git work tree" in out
+          and json.loads(sibling.read_text()) == EXISTING
+          and not dest_for(sibling).exists(), out[:300])
+
+    # Review objection 2: ~/.claude named another way ($HOME/x/../.claude) is
+    # still the user's own install - its dotfiles settings link is followed.
+    home4 = tmp / "home4"
+    (home4 / "x").mkdir(parents=True)
+    (home4 / ".claude").mkdir()
+    dot4 = tmp / "dotfiles4" / "settings.json"
+    dot4.parent.mkdir()
+    dot4.write_text(json.dumps(EXISTING), encoding="utf-8")
+    os.symlink(str(dot4), str(home4 / ".claude" / "settings.json"))
+    named = home4 / "x" / ".." / ".claude" / "settings.json"
+    code, out = run(named, home=home4)
+    check("~/.claude named as $HOME/x/../.claude: installs through the dotfiles link",
+          ".." in named.parts and code == 0
+          and os.path.islink(home4 / ".claude" / "settings.json")
+          and "PreToolUse" in json.loads(dot4.read_text())["hooks"]
+          and (home4 / ".claude" / "hooks" / "rc_env_guard.py").exists(), out[:200])
+
+    # Maintainer policy: "this is the user's ~/.claude" is decided by file
+    # identity, not by spelling. A path that is ~/.claude's directory but not
+    # named as ~/.claude is refused, with ~/.claude/settings.json to pass.
+    # Simulated portably by a second path to the same directory: the user's
+    # ~/.claude is a dotfiles link, and the dotfiles repo's real directory is
+    # named directly (no link in the named path, so only identity can tell).
+    home7 = tmp / "home7"
+    home7.mkdir()
+    dot7 = clone_dir("dotfiles7") / ".claude"
+    dot7.mkdir()
+    (dot7 / "settings.json").write_text(json.dumps(EXISTING), encoding="utf-8")
+    os.symlink(str(dot7), str(home7 / ".claude"))
+    code, out = run(dot7 / "settings.json", home=home7)
+    check("~/.claude's real directory named directly: refused by identity, "
+          "~/.claude/settings.json suggested, nothing changed",
+          code == 1 and "named another way" in out
+          and str(home7 / ".claude" / "settings.json") in out
+          and json.loads((dot7 / "settings.json").read_text()) == EXISTING
+          and not backups(dot7 / "settings.json") and not (dot7 / "hooks").exists(),
+          out[:300])
+    inst_id = load_module(INSTALLER, "installer_identity")
+    linked7 = tmp / "home7-alias"
+    os.symlink(str(home7), str(linked7))
+    check("_same_dir: one directory under two spellings is the same; others are not",
+          inst_id._same_dir(str(dot7), str(home7 / ".claude"))
+          and inst_id._same_dir(str(linked7 / ".claude"), str(dot7))
+          and not inst_id._same_dir(str(home7), str(dot7))
+          and not inst_id._same_dir(str(tmp / "no-such-dir"), str(tmp / "no-such-dir")))
+    # A spelling realpath does not canonicalize (as with letter case or the
+    # firmlink), simulated on any host: os.stat maps a not-existing ALIAS8
+    # onto home8, so only file identity can tell the two are one directory.
+    home8 = tmp / "home8"
+    (home8 / ".claude").mkdir(parents=True)
+    (home8 / ".claude" / "settings.json").write_text(json.dumps(EXISTING), encoding="utf-8")
+    alias_prefix = os.path.join(os.path.realpath(str(tmp)), "ALIAS8")
+    real_prefix = os.path.realpath(str(home8))
+    real_stat = os.stat
+
+    def stat_alias(path, *a, **k):
+        p = os.fspath(path)
+        if p == alias_prefix or p.startswith(alias_prefix + os.sep):
+            p = real_prefix + p[len(alias_prefix):]
+        return real_stat(p, *a, **k)
+
+    inst_id.DEFAULT_SETTINGS = home8 / ".claude" / "settings.json"
+    os.stat = stat_alias
+    try:
+        try:
+            verdict = inst_id.project_write_root(
+                tmp / "ALIAS8" / ".claude" / "settings.json")
+        except inst_id.Abort as exc:
+            verdict = "refused: " + str(exc)
+    finally:
+        os.stat = real_stat
+    check("~/.claude under a second spelling (simulated): refused by identity",
+          str(verdict).startswith("refused: ") and "named another way" in str(verdict),
+          str(verdict)[:200])
+    # The real spellings, where this host has them: another letter case on a
+    # case-insensitive volume, and macOS's /System/Volumes/Data firmlink. Each
+    # check is added only where the second spelling truly reaches ~/.claude.
+    spellings =[("another letter case", tmp / "HOME8" / ".claude" / "settings.json"),
+                 ("the /System/Volumes/Data firmlink",
+                  pathlib.Path("/System/Volumes/Data" + os.path.realpath(str(home8)))
+                  / ".claude" / "settings.json")]
+    for label, alias in spellings:
+        if not inst_id._same_dir(str(alias.parent), str(home8 / ".claude")):
+            print("SKIP ~/.claude named by %s: this host has no such second spelling" % label)
+            continue
+        code, out = run(alias, home=home8)
+        check("~/.claude named by %s: refused by identity, nothing changed" % label,
+              code == 1 and "named another way" in out
+              and json.loads((home8 / ".claude" / "settings.json").read_text()) == EXISTING
+              and not backups(home8 / ".claude" / "settings.json")
+              and not (home8 / ".claude" / "hooks").exists(), out[:300])
+
+    # Review objection 3: the decision does not trust a link because root owns
+    # it - in a clone made by root every committed link is uid 0. Simulated
+    # without root by making lstat report uid 0 for every entry.
+    inst_r = load_module(INSTALLER, "installer_root_owned")
+    inst_r.DEFAULT_SETTINGS = user_settings
+    root_clone = clone_dir("cwe59-root-clone")
+    os.symlink(str(user_dir), str(root_clone / ".claude"))
+    os.symlink(str(home), str(root_clone / "pkg"))
+    real_lstat, real_geteuid = os.lstat, getattr(os, "geteuid", None)
+
+    def lstat_as_root(path, *a, **k):
+        st = real_lstat(path, *a, **k)
+        return os.stat_result((st.st_mode, st.st_ino, st.st_dev, st.st_nlink, 0, 0,
+                               st.st_size, int(st.st_atime), int(st.st_mtime),
+                               int(st.st_ctime)))
+
+    def decide(settings_path):
+        try:
+            return inst_r.project_write_root(settings_path)
+        except inst_r.Abort:
+            return "refused"
+
+    os.lstat = lstat_as_root
+    if real_geteuid is not None:
+        os.geteuid = lambda: 1000
+    try:
+        simulated = os.lstat(str(root_clone / ".claude")).st_uid == 0
+        verdicts = [decide(root_clone / ".claude" / "settings.json"),
+                    decide(root_clone / "pkg" / ".claude" / "settings.json")]
+        above = decide(tmp / "code" / "proj" / ".claude" / "settings.json")
+    finally:
+        os.lstat = real_lstat
+        if real_geteuid is not None:
+            os.geteuid = real_geteuid
+    check("root-owned links in a clone (simulated uid 0): .claude and ancestor refused",
+          simulated and verdicts == ["refused", "refused"], str(verdicts))
+    check("root-owned link above a clone (simulated uid 0): refused, as any link",
+          above == "refused", str(above))
+
+    # Review objection 4: printed paths escape non-printable characters, so a
+    # committed link target cannot rewrite or hide the refusal.
+    check("_shown escapes control and bidi characters, keeps printable text",
+          inst_r._shown("a\x1b[2Kb\x07\n\u202e/\u30d7\u30ed")
+          == "a\\x1b[2Kb\\x07\\n\\u202e/\u30d7\u30ed")
+    esc = clone_dir("cwe59-escape")
+    os.symlink(str(home) + "/\x1b]0;owned\x07\x1b[2K\x1b[1A", str(esc / ".claude"))
+    code, out = run(esc / ".claude" / "settings.json", home=home)
+    check("escape: walk refusal shows the link target escaped, no raw ESC/BEL",
+          code == 1 and "Nothing was changed." in out and "\x1b" not in out
+          and "\x07" not in out and "\\x1b]0;owned\\x07" in out, repr(out[:300]))
+    p = repo_fixture({}, "cwe59-escape-hook")
+    dest_for(p).parent.mkdir()
+    os.symlink(str(home) + "/\x1b[2K\x1b[1Ax.py", str(dest_for(p)))
+    code, out = run(p, home=home)
+    check("escape: hook-file link refusal shows the link target escaped",
+          code == 1 and "Refusing" in out and "\x1b" not in out
+          and "\\x1b[2K\\x1b[1Ax.py" in out, repr(out[:300]))
+    p = repo_fixture({}, "cwe59-escape-hooks-dir")
+    os.symlink(str(home) + "/\x1b[2K\x1b[1Ax", str(p.parent / "hooks"))
+    code, out = run(p, home=home)
+    check("escape: outside-the-directory refusal shows the resolved path escaped",
+          code == 1 and "outside the settings directory" in out and "\x1b" not in out
+          and "\\x1b[2K\\x1b[1Ax/rc_env_guard.py" in out, repr(out[:300]))
 
     # --- backups cannot collide within one second ---------------------------
     inst = load_module(INSTALLER, "installer_under_test")

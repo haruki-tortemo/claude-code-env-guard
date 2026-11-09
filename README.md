@@ -133,6 +133,26 @@ overwrite it:
 - `--settings` only accepts `.claude/settings.json` / `.claude/settings.local.json` — the
   only paths the guard actually watches. Installing anywhere else would report success while
   guarding nothing, so it is refused.
+- **A project install does not follow symlinks** (a deliberate change; earlier versions
+  followed them). Any `--settings` outside `~/.claude/` (named as such) is treated as a
+  project's `.claude/`, which is repository content: a git clone or an unpacked archive can
+  carry symlinks that would send the install, or your user settings, somewhere you never
+  named. So the installer refuses, and changes nothing, when:
+  - a directory in the path you name is a symlink — committed in a clone or not, and
+    including your own links above a clone such as `~/code -> ~/src`. Only the system's own
+    links directly under `/` (`/tmp`, `/var` on macOS) are followed;
+  - the hook file `.claude/hooks/rc_env_guard.py` is a symlink, even to a file inside
+    `.claude/` (for example `../settings.local.json`, which the hook copy would overwrite);
+  - the settings file or `hooks/` is a symlink leading out of that `.claude/` directory (a
+    link that stays inside it is followed);
+  - the path is your own `~/.claude` named another way: another letter case, the
+    `/System/Volumes/Data/...` spelling, or the real directory behind a dotfiles link.
+
+  When refused, the message prints the resolved path: pass that path to `--settings` instead
+  (for your user settings, `~/.claude/settings.json`), or remove the hook-file symlink.
+  Installing into `~/.claude` itself keeps following symlinks there (dotfiles), as before.
+  A relative `--settings` is resolved against your shell's current directory (including any
+  symlink you `cd`ed through), and the hook is always registered by its absolute path.
 
 Restart Claude Code afterwards.
 

@@ -114,6 +114,159 @@ def hook_destination(settings: Path) -> Path:
     return settings.parent / "hooks" / HOOK_NAME
 
 
+def _shown(value) -> str:
+    """`value` for a terminal: non-printable characters escaped, so a crafted
+    file or link name cannot rewrite or hide the message printed around it."""
+    return "".join(c if c.isprintable() else c.encode("unicode_escape").decode("ascii")
+                   for c in str(value))
+
+
+def _strictly_inside(root: str, path: str) -> bool:
+    try:
+        return path != root and os.path.commonpath([root, path]) == root
+    except ValueError:                  # e.g. different drives on Windows
+        return False
+
+
+def _in_work_tree(real_dir: str) -> bool:
+    """Is this resolved directory inside a git work tree (it, or a directory
+    above it, has a `.git` entry)? Anything in a work tree, symlinks included,
+    can be committed repository content."""
+    d = real_dir
+    while True:
+        if os.path.lexists(os.path.join(d, ".git")):
+            return True
+        parent = os.path.dirname(d)
+        if parent == d:
+            return False
+        d = parent
+
+
+def _same_dir(a: str, b: str) -> bool:
+    """Are `a` and `b` one directory on disk? File identity, not spelling: on a
+    case-insensitive volume `.CLAUDE` is `.claude`, and on macOS
+    /System/Volumes/Data/Users/... is /Users/..., yet the strings differ."""
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+def working_dir() -> str:
+    """The working directory as the shell names it.
+
+    os.getcwd() is the physical path: if the user reached the directory with
+    `cd` through a symlink, the link is already gone from it, so a relative
+    --settings would hide that link from project_write_root. The shell's $PWD
+    keeps it. Trust $PWD only when it is absolute and names the same directory.
+    """
+    cwd = os.getcwd()
+    pwd = os.environ.get("PWD", "")
+    if os.path.isabs(pwd) and _same_dir(pwd, cwd):
+        return os.path.normpath(pwd)
+    return cwd
+
+
+def project_write_root(settings: Path):
+    """The real directory a project-level install may write in, or None for an
+    install into the user's own ~/.claude.
+
+    A project's `.claude/` is repository content, and git checks committed
+    symlinks out as symlinks. Found in review: a symlink committed at the hook
+    file, at `hooks/`, at `.claude`, at `settings.json` (to the user's
+    ~/.claude/settings.json) or at a directory above `.claude` let a project
+    install write files the user never named - including merging our
+    registration, pointing into the repository, into the user's GLOBAL
+    settings. A link in an unpacked archive (`.claude -> ../<another
+    clone>/.claude`) retargets the install just the same, and nothing on disk
+    tells such a link apart from one the user made. So for any path other than
+    ~/.claude named as such, fail safe:
+
+      - a symlink anywhere in the named directory path is refused - inside a
+        git work tree (it may have been committed) and outside one (it cannot
+        be told apart from an archive's), whoever owns it. Only the filesystem
+        root's own links (/tmp, /var on macOS) are followed. The refusal names
+        the resolved path, which the user can pass instead;
+      - a path that is the user's ~/.claude by file identity but named another
+        way (another letter case, the /System/Volumes/Data firmlink, the real
+        directory behind a dotfiles link) is refused;
+      - the hook file itself must not be a symlink, even to a file inside the
+        directory: a committed `hooks/rc_env_guard.py -> ../settings.local.json`
+        would have the hook copy overwrite the user's local settings;
+      - every file written or removed must resolve inside that directory
+        (require_inside). A settings-file or `hooks/` link that stays inside
+        it keeps working.
+
+    ~/.claude itself keeps following every symlink: it is the user's own, and
+    dotfiles-managed links there are expected.
+    """
+    named_dir = Path(working_dir(), settings.parent)
+    home_claude = os.path.abspath(str(DEFAULT_SETTINGS.parent))
+    home_real = os.path.realpath(home_claude)
+    real_dir = os.path.realpath(str(named_dir))
+    own = real_dir == home_real or _same_dir(real_dir, home_real)
+    if own and os.path.abspath(str(named_dir)) in (
+            home_claude,
+            os.path.join(os.path.realpath(os.path.dirname(home_claude)),
+                         os.path.basename(home_claude))):
+        return None
+    suggest = os.path.join(home_claude if own else real_dir, settings.name)
+    probe = Path(named_dir.parts[0])
+    for part in named_dir.parts[1:]:
+        holder = os.path.realpath(str(probe))      # the real directory the entry is in
+        probe = probe / part
+        try:
+            st = os.lstat(str(probe))
+        except OSError:
+            break
+        if not stat.S_ISLNK(st.st_mode) or holder == os.path.dirname(holder):
+            continue                    # not a link, or the system's own (/tmp, /var)
+        if _in_work_tree(holder):
+            why = ("it is inside a git work tree, so the repository may have committed it;\n"
+                   "following it could send the install anywhere, even into your user settings")
+        else:
+            why = ("it is outside any git work tree, where a link of yours cannot be told\n"
+                   "apart from one unpacked from an archive")
+        raise Abort(
+            "%s is a symlink (to %s).\n"
+            "Refusing to follow it: %s.\n"
+            "If %s is where you mean to install, pass that path instead.\n"
+            "Nothing was changed." % (
+                _shown(probe), _shown(os.readlink(str(probe))), why, _shown(suggest)))
+    if own:
+        raise Abort(
+            "%s is your user settings directory %s, named another way.\n"
+            "Refusing to install there as if it were a project's.\n"
+            "If %s is where you mean to install, pass that path instead.\n"
+            "Nothing was changed." % (
+                _shown(named_dir), _shown(home_claude), _shown(suggest)))
+    hook = hook_destination(settings)
+    if os.path.islink(str(hook)):
+        raise Abort(
+            "%s is a symlink (to %s).\n"
+            "Refusing to write the hook through it: in a project's settings directory\n"
+            "a link the project carries can aim it at another file, such as\n"
+            "settings.local.json.\n"
+            "Remove the link if the hook belongs at that path.\n"
+            "Nothing was changed." % (_shown(hook), _shown(os.readlink(str(hook)))))
+    return real_dir
+
+
+def require_inside(root, path: Path, follow: bool = True) -> Path:
+    """`path` with symlinks resolved - all but its last component when
+    `follow` is false, which is where removing it acts. For a project install
+    (`root` set), refuse unless that lies inside the project's settings
+    directory."""
+    real = (os.path.realpath(str(path)) if follow else
+            os.path.join(os.path.realpath(str(path.parent)), path.name))
+    if root is not None and not _strictly_inside(root, real):
+        raise Abort(
+            "%s resolves to %s, outside the settings directory %s.\n"
+            "Refusing to follow a symlink out of a project's settings directory."
+            % (_shown(path), _shown(real), _shown(root)))
+    return Path(real)
+
+
 def guard_command(dest: Path) -> str:
     return "python3 %s" % shlex.quote(str(dest))
 
@@ -330,10 +483,13 @@ def hook_copy_change(dest: Path):
     return "install hook file at %s" % dest
 
 
-def copy_hook(dest: Path) -> None:
+def copy_hook(dest: Path, root: str = None) -> None:
     # Follow a symlink: write the real file so a dotfiles-managed hook path is
-    # updated in place rather than replaced with a regular file.
-    real = Path(os.path.realpath(str(dest)))
+    # updated in place rather than replaced with a regular file. In a project
+    # (`root` set) the hook file is never written through: project_write_root
+    # refused a link there, and the entry itself is replaced, so one appearing
+    # since is not followed either.
+    real = require_inside(root, dest, follow=root is None)
     real.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".rc-env-guard-", suffix=".tmp")
     try:
@@ -368,10 +524,13 @@ def unique_backup_open(path: Path):
             n += 1
 
 
-def write_atomically(path: Path, data: dict, known_mtime_ns: int = None) -> Path:
+def write_atomically(path: Path, data: dict, known_mtime_ns: int = None,
+                     root: str = None) -> Path:
     # Operate on the real file so a symlinked settings.json is updated in place,
     # not converted to a regular file that detaches the user's dotfiles copy.
-    real = Path(os.path.realpath(str(path)))
+    # In a project (`root` set) only a link that stays in its settings
+    # directory is followed.
+    real = require_inside(root, path)
 
     # Open the source ONCE with O_NOFOLLOW and read the backup from that fd, so
     # the "resolve path, then read it by name" window cannot be raced (swapping
@@ -467,9 +626,25 @@ def main() -> int:
               file=sys.stderr)
         return 1
 
+    # Work on the absolute path the user named (after the gate above, which
+    # judges the argument as typed). A relative --settings would otherwise be
+    # checked against the physical cwd (hiding a symlink the user `cd`ed
+    # through) and registered as a relative command, which in user settings
+    # would run each project's own .claude/hooks file.
+    if not args.settings.is_absolute():
+        args.settings = Path(working_dir(), args.settings)
+
     dest = hook_destination(args.settings)
 
     try:
+        # Before reading anything, and in --dry-run too: no symlink a project
+        # may carry (committed, or unpacked from an archive) can move a write,
+        # or the uninstall's delete, out of the directory the user named, and
+        # the hook copy is never written through one (see project_write_root).
+        write_root = project_write_root(args.settings)
+        require_inside(write_root, args.settings)
+        require_inside(write_root, dest)
+        require_inside(write_root, dest, follow=False)   # where --uninstall removes
         data = load_settings(args.settings)
         mtime_ns = os.stat(os.path.realpath(str(args.settings))).st_mtime_ns
         if args.uninstall:
@@ -519,7 +694,7 @@ def main() -> int:
         if args.uninstall:
             settings_changes = [c for c in changes if not c.startswith("remove hook file")]
             if settings_changes:
-                backup = write_atomically(args.settings, data, mtime_ns)
+                backup = write_atomically(args.settings, data, mtime_ns, write_root)
             if changes and dest.exists():
                 try:
                     os.remove(str(dest))
@@ -529,10 +704,10 @@ def main() -> int:
         else:
             # Copy the hook first: the registration must never point at a missing file.
             if copy_change:
-                copy_hook(dest)
+                copy_hook(dest, write_root)
             settings_changes = [c for c in changes if c is not copy_change]
             if settings_changes:
-                backup = write_atomically(args.settings, data, mtime_ns)
+                backup = write_atomically(args.settings, data, mtime_ns, write_root)
     except Abort as exc:
         print(str(exc), file=sys.stderr)
         return 1
