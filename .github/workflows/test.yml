@@ -12,8 +12,12 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to 26.04, which has no Python 3.9 build for
+    # setup-python. 24.04 still provides the floor this job exists to test.
+    runs-on: ubuntu-24.04
     strategy:
+      # One version failing must not cancel the others' results.
+      fail-fast: false
       matrix:
         # 3.9 is the interpreter floor; 3.14 is the current feature series.
         python-version: ["3.9", "3.13", "3.14"]
